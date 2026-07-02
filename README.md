@@ -169,7 +169,7 @@ The **ImGui overlay** (F9 to toggle) shows capture progress, a tile progress bar
 |---------|---------|
 | [MinHook](https://github.com/TsudaKageyu/minhook) | Vtable / IAT hooking |
 | [DirectXTex](https://github.com/microsoft/DirectXTex) | PNG encoding, surface conversion |
-| [Dear ImGui](https://github.com/ocornut/imgui) | In-game overlay (Phase 3, not yet wired) |
+| [Dear ImGui](https://github.com/ocornut/imgui) | In-game overlay (active, F9 toggle) |
 
 ## License
 
