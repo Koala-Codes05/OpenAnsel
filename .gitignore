@@ -1,0 +1,33 @@
+# Build directories
+build/
+bin/
+obj/
+
+# Compiler/MSVC files
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# IDE/Editor metadata
+.vs/
+.idea/
+.vscode/
+.gemini/
+.agents/
+
+# User custom scratch files
+vtable.txt
+methods.txt
+parse.py
+scratch_parse.py
+scratch_vtable.cpp
+offset.c
+offset.exe
+offset.obj
+vtable.exe
+vtable.obj
+vtable.cpp
