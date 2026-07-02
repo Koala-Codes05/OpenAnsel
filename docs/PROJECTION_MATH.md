@@ -74,9 +74,53 @@ f = E * n / (E - 1)
 
 These recovered values are used to build the per-tile sub-frustums.
 
-## Implementation
+## Implementation: Clip-Space Tile Matrix (Current Approach)
 
-See `src/math/tile_projection.h` for the implementation of `BuildTileProjectionMatrix`.
+The current DX9 backend uses a simpler and more robust approach: instead of recovering frustum parameters and building an off-axis projection, we **post-multiply** a clip-space NDC-scale+offset matrix onto the camera's existing VP matrix.
+
+Given a clip-space (row-major) VP matrix `M`, we compute:
+
+```
+T = clip-tile matrix for tile (tx, ty) in an NX×NY grid
+M' = M × T
+```
+
+Where `T` is defined as:
+
+```
+T = [ NX    0    0  0 ]
+    [  0   NY    0  0 ]
+    [  0    0    1  0 ]
+    [  ox   oy   0  1 ]
+
+ox = NX - 2*tx - 1       (shift in NDC x)
+oy = 2*ty + 1 - NY       (shift in NDC y; DX9 NDC has +y = up)
+```
+
+This post-multiply shifts the NDC-space tile into the full backbuffer.
+
+### Why this approach?
+
+- No need to recover `fovY`, `aspect`, `near`, `far` from the matrix elements.
+- Works with **any** projection matrix (perspective, orthographic, custom).
+- Does **not** require knowing the original frustum parameters.
+- The camera position, orientation, FOV, and near/far planes remain exactly the same.
+- Handled identically for both fixed-function (`SetTransform`) and shader (`SetVertexShaderConstantF`) paths.
+
+### VP Matrix Heuristic
+
+In the programmable-pipeline path, we need to find which shader constant register holds the VP matrix. The heuristic (`LooksLikeVPMatrix`) checks whether the third column (camera forward vector in a row-major VP) has unit length within ±10%:
+
+```
+forwardZ = d[3]² + d[7]² + d[11]²
+0.81 ≤ forwardZ ≤ 1.21  ⇒  VP matrix candidate
+```
+
+### `GetVertexShaderConstantF` Interception
+
+UE3 reads the VP matrix back each frame via `GetVertexShaderConstantF` for CPU-side frustum culling and LOD selection. If it reads our tiled matrix, it sees geometry outside the shifted frustum and aborts rendering (Present never fires). The `GetVertexShaderConstantF` hook intercepts these reads and returns the **original** (un-tiled) VP matrix stored during the last `SetVertexShaderConstantF` call.
+
+See `src/math/tile_projection.h` for the implementation of `BuildClipTileMatrix`.
 
 ## Example: 2×2 Tiles
 
