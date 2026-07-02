@@ -28,27 +28,43 @@ bool ImageWriter::Initialize(uint32_t tileCountX, uint32_t tileCountY,
     return SUCCEEDED(hr);
 }
 
+#include <cstdio>
+static void LogWriter(const char* msg) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, "OpenAnsel_dx9.log", "a") == 0 && f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
+
 bool ImageWriter::AddTile(uint32_t tileX, uint32_t tileY,
                           uint32_t width, uint32_t height,
                           const void* pixels, DXGI_FORMAT format) {
-    if (!pixels || tileX >= tileCountX_ || tileY >= tileCountY_) {
+    if (!pixels) {
+        LogWriter("AddTile: pixels is null");
+        return false;
+    }
+    if (tileX >= tileCountX_ || tileY >= tileCountY_) {
+        char buf[128];
+        sprintf_s(buf, "AddTile: tile coordinates out of bounds: (%u, %u) vs count (%u, %u)",
+                  tileX, tileY, tileCountX_, tileCountY_);
+        LogWriter(buf);
         return false;
     }
 
     DirectX::ScratchImage source;
     HRESULT hr = source.Initialize2D(format, width, height, 1, 1);
     if (FAILED(hr)) {
+        char buf[128];
+        sprintf_s(buf, "AddTile: source.Initialize2D failed with hr=0x%08X", (uint32_t)hr);
+        LogWriter(buf);
         return false;
     }
 
     const DirectX::Image* srcImg = source.GetImage(0, 0, 0);
     if (!srcImg) {
+        LogWriter("AddTile: source.GetImage returned null");
         return false;
     }
 
     // Copy raw pixels into the ScratchImage, respecting row pitch.
-    // The input pixels are tightly packed (width * bpp * height), but
-    // ScratchImage may have a different rowPitch due to alignment.
     const uint32_t srcBpp = srcImg->rowPitch / srcImg->width;
     const size_t srcRowBytes = width * srcBpp;
     for (uint32_t row = 0; row < height; ++row) {
@@ -62,6 +78,9 @@ bool ImageWriter::AddTile(uint32_t tileX, uint32_t tileY,
     if (format != tileFormat_) {
         hr = DirectX::Convert(*srcImg, tileFormat_, DirectX::TEX_FILTER_DEFAULT, 0.5f, converted);
         if (FAILED(hr)) {
+            char buf[128];
+            sprintf_s(buf, "AddTile: DirectX::Convert failed with hr=0x%08X", (uint32_t)hr);
+            LogWriter(buf);
             return false;
         }
     } else {
@@ -70,12 +89,14 @@ bool ImageWriter::AddTile(uint32_t tileX, uint32_t tileY,
 
     const DirectX::Image* tileImg = converted.GetImage(0, 0, 0);
     if (!tileImg) {
+        LogWriter("AddTile: converted.GetImage returned null");
         return false;
     }
 
     // Copy the converted tile into the stitched image buffer.
     const DirectX::Image* destImg = stitchedImage_.GetImage(0, 0, 0);
     if (!destImg) {
+        LogWriter("AddTile: stitchedImage_.GetImage returned null");
         return false;
     }
 

@@ -223,6 +223,9 @@ bool ReadBackTile(IDirect3DDevice9* device, IDirect3DSurface9* src, uint32_t til
     D3DLOCKED_RECT locked;
     hr = staging->LockRect(&locked, nullptr, D3DLOCK_READONLY);
     if (FAILED(hr)) {
+        char buf[128];
+        sprintf_s(buf, "ReadBackTile: LockRect failed with hr=0x%08X", (uint32_t)hr);
+        CaptureLog(buf);
         staging->Release();
         return false;
     }
@@ -286,12 +289,21 @@ bool ReadBackTile(IDirect3DDevice9* device, IDirect3DSurface9* src, uint32_t til
         CaptureLog(buf);
         return false;
     }
-    return g_capture.writer->AddTile(tileX, tileY, desc.Width, desc.Height,
-                                     g_capture.tilePixels.data(), dxgiFmt);
+    
+    bool ok = g_capture.writer->AddTile(tileX, tileY, desc.Width, desc.Height,
+                                        g_capture.tilePixels.data(), dxgiFmt);
+    if (!ok) {
+        CaptureLog("ReadBackTile: writer->AddTile returned false");
+    }
+    return ok;
 }
 
 bool IsHotkeyPressed() {
-    return (GetAsyncKeyState(VK_F11) & 0x0001) != 0;
+    static bool s_wasDown = false;
+    bool isDown = ((GetAsyncKeyState(VK_F10) & 0x8000) != 0) || ((GetAsyncKeyState(VK_F11) & 0x8000) != 0);
+    bool pressed = isDown && !s_wasDown;
+    s_wasDown = isDown;
+    return pressed;
 }
 
 void UpdateHotkey() {
@@ -302,7 +314,7 @@ void UpdateHotkey() {
             config.tileCountX = g_cfgTileCountX;
             config.tileCountY = g_cfgTileCountY;
             core.RequestCapture(config);
-            CaptureLog("UpdateHotkey: capture requested (F11)");
+            CaptureLog("UpdateHotkey: capture requested");
         }
     }
 }
@@ -380,8 +392,8 @@ void HookDeviceVtable(IDirect3DDevice9* device) {
     // aborts the frame so Present never fires.
     ok &= (MH_CreateHook(vtable[95], &GetVertexShaderConstantF_Hook,
                          reinterpret_cast<void**>(&GetVertexShaderConstantF_Original)) == MH_OK);
-    ok &= (MH_CreateHook(vtable[109], &SetPixelShaderConstantF_Hook,
-                         reinterpret_cast<void**>(&SetPixelShaderConstantF_Original)) == MH_OK);
+    // ok &= (MH_CreateHook(vtable[109], &SetPixelShaderConstantF_Hook,
+    //                      reinterpret_cast<void**>(&SetPixelShaderConstantF_Original)) == MH_OK);
 
     if (ok) {
         MH_EnableHook(vtable[17]);
@@ -390,7 +402,7 @@ void HookDeviceVtable(IDirect3DDevice9* device) {
         MH_EnableHook(vtable[44]);
         MH_EnableHook(vtable[94]);
         MH_EnableHook(vtable[95]);
-        MH_EnableHook(vtable[109]);
+        // MH_EnableHook(vtable[109]);
         CaptureLog("HookDeviceVtable: all device hooks enabled");
 
         // Hook swap chain Present if available.

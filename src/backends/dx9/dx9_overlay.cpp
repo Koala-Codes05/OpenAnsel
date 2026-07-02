@@ -61,6 +61,11 @@ static bool       g_showOverlay   = true;   // toggled by F9
 static HWND       g_hwnd          = nullptr;
 static WNDPROC    g_origWndProc   = nullptr;
 
+static void LogWriter(const char* msg) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, "OpenAnsel_dx9.log", "a") == 0 && f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
+
 // ─── WndProc subclass ─────────────────────────────────────────────────────────
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -74,7 +79,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
     }
-    return CallWindowProcW(g_origWndProc, hwnd, msg, wParam, lParam);
+    if (g_origWndProc) {
+        return CallWindowProcW(g_origWndProc, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 // ─── Helper: wstring → UTF-8 for ImGui ───────────────────────────────────────
@@ -284,16 +292,22 @@ void InitOverlay(IDirect3DDevice9* device, HWND hwnd) {
     style.Colors[ImGuiCol_WindowBg]      = ImVec4(0.08f, 0.08f, 0.10f, 0.90f);
 
     // ── Backends ──────────────────────────────────────────────────────────────
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX9_Init(device);
+    if (!ImGui_ImplWin32_Init(hwnd)) { ImGui::DestroyContext(); return; }
+    if (!ImGui_ImplDX9_Init(device)) { ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); return; }
 
     // ── Subclass the game window's WndProc ────────────────────────────────────
     g_hwnd = hwnd;
     g_origWndProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(OverlayWndProc)));
+    if (!g_origWndProc) {
+        ImGui_ImplDX9_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+        g_hwnd = nullptr;
+        return;
+    }
 
     g_initialized = true;
+    LogWriter("InitOverlay: initialized");
 }
 
 void ShutdownOverlay() {
