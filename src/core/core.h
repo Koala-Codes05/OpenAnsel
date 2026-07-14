@@ -15,6 +15,18 @@ enum class CaptureState {
     Error
 };
 
+enum class FreeCamMode {
+    Disabled,
+    LimitedOverride
+};
+
+struct FreeCamConfig {
+    bool enabled = false;
+    float moveSpeed = 1.0f;
+    float lookSpeed = 1.0f;
+    float fovDelta = 0.0f;
+};
+
 struct CaptureConfig {
     uint32_t tileCountX = 2;
     uint32_t tileCountY = 2;
@@ -38,12 +50,18 @@ public:
     bool IsCaptureRequested() const;
     void ClearRequest();
 
+    FreeCamConfig GetFreeCamConfig() const;
+    void SetFreeCamConfig(const FreeCamConfig& config);
+
 private:
     Core() = default;
 
     std::atomic<CaptureState> state_{CaptureState::Idle};
     CaptureConfig pendingConfig_;
     std::mutex configMutex_;
+
+    FreeCamConfig freeCamConfig_;
+    mutable std::mutex freeCamMutex_;
 };
 
 } // namespace OpenAnsel

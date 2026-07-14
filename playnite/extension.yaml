@@ -1,0 +1,9 @@
+Id: OpenAnsel_Playnite_Extension
+Name: OpenAnsel Integration
+Author: Anakin
+Version: 1.0.0
+Module: OpenAnselPlaynite.psm1
+Type: Script
+Links:
+  - Name: GitHub
+    Url: https://github.com/Koala-Codes05/OpenAnsel

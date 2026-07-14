@@ -190,6 +190,54 @@ void BuildOverlayUI() {
         ImGui::EndDisabled();
     }
 
+    // ── Free Camera Section ──────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 0.75f, 1.00f, 1.00f));
+    ImGui::Text("  Free Camera (Experimental)");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    FreeCamConfig camCfg = Core::Instance().GetFreeCamConfig();
+    bool camEnabled = camCfg.enabled;
+    if (ImGui::Checkbox("Enable Free Camera [F8]", &camEnabled)) {
+        camCfg.enabled = camEnabled;
+        Core::Instance().SetFreeCamConfig(camCfg);
+    }
+
+    if (camCfg.enabled) {
+        ImGui::SliderFloat("Move Speed", &camCfg.moveSpeed, 0.1f, 10.0f, "%.1fx");
+        ImGui::SliderFloat("Look Speed", &camCfg.lookSpeed, 0.1f, 5.0f, "%.1fx");
+        Core::Instance().SetFreeCamConfig(camCfg);
+    }
+
+    FreeCamStatusInfo camStatus = QueryFreeCamStatus();
+    ImGui::Spacing();
+    ImGui::Text("FreeCam Status: ");
+    ImGui::SameLine();
+    if (camStatus.active) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.20f, 1.00f, 0.40f, 1.0f));
+        ImGui::TextUnformatted("Active");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+        ImGui::TextUnformatted("Disabled");
+        ImGui::PopStyleColor();
+    }
+
+    if (camStatus.vpRegisterTracked) {
+        ImGui::Text("VP Register: Tracked (reg %d)", camStatus.vpRegister);
+    } else {
+        ImGui::Text("VP Register: Not Tracked");
+    }
+
+    ImGui::Text("Substitution: %s", camStatus.substitutionHappened ? "Yes" : "No");
+    if (camStatus.active) {
+        ImGui::Text("Camera Pos: (%.2f, %.2f, %.2f)", camStatus.cameraPos[0], camStatus.cameraPos[1], camStatus.cameraPos[2]);
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -330,10 +378,13 @@ void ShutdownOverlay() {
 void RenderOverlay() {
     if (!g_initialized) return;
 
-    // F9 toggles visibility (one-shot via the low-order bit).
-    if (GetAsyncKeyState(VK_F9) & 0x0001) {
+    // F9 toggles visibility (reliably via state change tracking)
+    static bool s_wasDown = false;
+    bool isDown = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (isDown && !s_wasDown) {
         g_showOverlay = !g_showOverlay;
     }
+    s_wasDown = isDown;
 
     if (!g_showOverlay) {
         ImGui::GetIO().MouseDrawCursor = false;

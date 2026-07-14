@@ -56,16 +56,21 @@ void ProxyLog(const char* msg) {
 void EnsureRealD3D9() {
     if (g_realD3D9) return;
 
-    wchar_t sysDir[MAX_PATH];
-    GetSystemDirectoryW(sysDir, MAX_PATH);
-    wcscat_s(sysDir, L"\\d3d9.dll");
-    g_realD3D9 = LoadLibraryW(sysDir);
+    // Check for a renamed local ReShade DLL first to allow chaining
+    g_realD3D9 = LoadLibraryW(L"reshade_d3d9.dll");
+
+    if (!g_realD3D9) {
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectoryW(sysDir, MAX_PATH);
+        wcscat_s(sysDir, L"\\d3d9.dll");
+        g_realD3D9 = LoadLibraryW(sysDir);
+    }
 
     if (!g_realD3D9) {
         ProxyLog("EnsureRealD3D9: LoadLibrary failed!");
         return;
     }
-    ProxyLog("EnsureRealD3D9: real d3d9.dll loaded");
+    ProxyLog("EnsureRealD3D9: underlying d3d9.dll loaded");
 
     // Grab originals used by the hook implementation.
     OpenAnsel::DX9::Direct3DCreate9_Original =

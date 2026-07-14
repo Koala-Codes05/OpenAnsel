@@ -1,0 +1,7 @@
+C:/Users/Anakin/OpenAnsel/build64/CMakeFiles/ALL_BUILD.dir
+C:/Users/Anakin/OpenAnsel/build64/CMakeFiles/ZERO_CHECK.dir
+C:/Users/Anakin/OpenAnsel/build64/src/core/CMakeFiles/openansel_core.dir
+C:/Users/Anakin/OpenAnsel/build64/src/backends/dxgi/CMakeFiles/openansel_dxgi.dir
+C:/Users/Anakin/OpenAnsel/build64/src/io/CMakeFiles/openansel_io.dir
+C:/Users/Anakin/OpenAnsel/build64/src/injector/CMakeFiles/openansel_injector.dir
+C:/Users/Anakin/OpenAnsel/build64/src/launcher/CMakeFiles/openansel_launcher.dir

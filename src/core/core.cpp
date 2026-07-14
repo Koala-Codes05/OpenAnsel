@@ -34,4 +34,14 @@ void Core::ClearRequest() {
     state_.store(CaptureState::Idle);
 }
 
+FreeCamConfig Core::GetFreeCamConfig() const {
+    std::lock_guard<std::mutex> lock(freeCamMutex_);
+    return freeCamConfig_;
+}
+
+void Core::SetFreeCamConfig(const FreeCamConfig& config) {
+    std::lock_guard<std::mutex> lock(freeCamMutex_);
+    freeCamConfig_ = config;
+}
+
 } // namespace OpenAnsel

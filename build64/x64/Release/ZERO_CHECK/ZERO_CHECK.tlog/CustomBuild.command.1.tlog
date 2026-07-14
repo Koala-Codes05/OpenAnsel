@@ -1,0 +1,10 @@
+^C:\USERS\ANAKIN\OPENANSEL\BUILD64\CMAKEFILES\C935198925D136797243E56C2E18E7D0\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/Anakin/OpenAnsel -BC:/Users/Anakin/OpenAnsel/build64 --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/Anakin/OpenAnsel/build64/OpenAnsel.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

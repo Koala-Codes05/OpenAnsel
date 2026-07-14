@@ -74,4 +74,13 @@ struct CaptureProgressInfo {
 };
 CaptureProgressInfo QueryCaptureProgress();
 
+struct FreeCamStatusInfo {
+    bool active = false;
+    bool vpRegisterTracked = false;
+    int vpRegister = -1;
+    bool substitutionHappened = false;
+    float cameraPos[3] = {};
+};
+FreeCamStatusInfo QueryFreeCamStatus();
+
 } // namespace OpenAnsel::DX9

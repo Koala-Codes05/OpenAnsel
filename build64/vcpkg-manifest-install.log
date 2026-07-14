@@ -1,0 +1,51 @@
+Detecting compiler hash for triplet x64-windows...
+Compiler found: C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe
+The following packages will be built and installed:
+  * directxmath:x64-windows@2026-06-12
+    directxtex[core,dx11]:x64-windows@2026-05-07
+    imgui[core,dx9-binding,win32-binding]:x64-windows@1.92.8#1
+    minhook:x64-windows@1.3.4
+  * vcpkg-cmake:x64-windows@2024-04-23
+  * vcpkg-cmake-config:x64-windows@2024-05-23
+Additional packages (*) will be modified to complete this operation.
+Restored 6 package(s) from C:\Users\Anakin\AppData\Local\vcpkg\archives in 994 ms. Use --debug to see more details.
+Installing 1/6 vcpkg-cmake-config:x64-windows@2024-05-23...
+vcpkg-cmake-config:x64-windows@2024-05-23 package ABI: 98afe6c8a165d2bcaa637117fa765403e148e9bd9f8ce8bbc249dc25b2fbc060
+Elapsed time to handle vcpkg-cmake-config:x64-windows: 22.2 ms
+Installing 2/6 vcpkg-cmake:x64-windows@2024-04-23...
+vcpkg-cmake:x64-windows@2024-04-23 package ABI: ea0531ad9329041f6fa59d287fab396c3970c97d85910a89c61fa3676d6050b9
+Elapsed time to handle vcpkg-cmake:x64-windows: 38.9 ms
+Installing 3/6 directxmath:x64-windows@2026-06-12...
+directxmath:x64-windows@2026-06-12 package ABI: e50337e435654af7184b75d8dceeced2b6441da2e7ed02dfc4f3a88eba46a5c1
+Elapsed time to handle directxmath:x64-windows: 55 ms
+Installing 4/6 directxtex[core,dx11]:x64-windows@2026-05-07...
+directxtex[core,dx11]:x64-windows@2026-05-07 package ABI: ba0430fcd2ae959894090bed61a751474315310091cc81d03c7682111b97f533
+Elapsed time to handle directxtex:x64-windows: 46.1 ms
+Installing 5/6 imgui[core,dx9-binding,win32-binding]:x64-windows@1.92.8#1...
+imgui[core,dx9-binding,win32-binding]:x64-windows@1.92.8#1 package ABI: 3b6a0f64f82cdb7ae11a20c7e82c3866020aaa5473c11ea42ac8afee57bada3a
+Elapsed time to handle imgui:x64-windows: 51.2 ms
+Installing 6/6 minhook:x64-windows@1.3.4...
+minhook:x64-windows@1.3.4 package ABI: 2d9396ace7093e5334713cbd696a0686fa5e9060d256589071bbe89e9aecde2f
+Elapsed time to handle minhook:x64-windows: 43.2 ms
+Installed contents are licensed to you by owners. Microsoft is not responsible for, nor does it grant any licenses to, third-party packages.
+Packages installed in this vcpkg installation declare the following licenses:
+BSD-2-Clause
+MIT
+The DirectXTex package provides CMake targets:
+
+    find_package(directxtex CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE Microsoft::DirectXTex)
+
+imgui provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(imgui CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE imgui::imgui)
+
+minhook provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(minhook CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE minhook::minhook)
+
+All requested installations completed successfully in: 277 ms

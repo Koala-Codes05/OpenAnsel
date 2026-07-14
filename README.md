@@ -19,6 +19,18 @@ An open-source, NVIDIA Ansel-like tiled super-resolution screenshot tool for Win
   - `GetVertexShaderConstantF` hook to prevent UE3 CPU-side frustum culling from aborting tiled frames
 - **Phase 3** – DirectX 11/12 back-ends, memory-efficient streaming stitching (planned).
 
+## Vision: The Universal Photo Mode
+
+OpenAnsel aims to be more than just a tiled capture utility—it is designed to become a **universal virtual photography toolkit** for games that never had a photo mode. 
+
+Instead of imitating specific GPU-vendor features, OpenAnsel's philosophy is: **"Spend 30 seconds making this one frame as good as possible."**
+
+The long-term roadmap includes combining several techniques:
+1. **Engine Manipulation & Freecam:** Interacting with the game's memory (similar to Cheat Engine or UUU) to detach the camera, change FOV, and hide HUD elements.
+2. **True Tiled Rendering:** Manipulating the camera's projection matrix to take multiple screenshots and stitch them into a massive, high-detail 8K or 16K image.
+3. **AI Restoration:** Integrating open-source AI upscaling (like Real-ESRGAN) to enhance textures and clean up artifacts.
+4. **Depth Export:** Capturing the DirectX depth buffer to export alongside the image, allowing for custom Depth of Field processing in post.
+
 ## Project Structure
 
 ```

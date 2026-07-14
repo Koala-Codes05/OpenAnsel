@@ -36,6 +36,8 @@ SwapChainPresent_t         SwapChainPresent_Original         = nullptr;
 
 namespace {
 
+static uint64_t s_lastOverlayTick = 0;
+
 void CaptureLog(const char* msg) {
     FILE* f = nullptr;
     if (fopen_s(&f, "OpenAnsel_dx9.log", "a") == 0 && f) { fprintf(f, "%s\n", msg); fclose(f); }
@@ -84,13 +86,24 @@ DXGI_FORMAT D3DFormatToDXGI(D3DFORMAT fmt) {
     }
 }
 
-// Detect a row-major VP or LocalToClip (MVP) matrix uploaded via SVSCF.
-// For any such matrix, column 3 = (d[3],d[7],d[11]) is the camera forward
-// vector (unit length) because P maps forward to W_clip = z_view.
-// Restrict to vwc==4 uploads to exclude large constant-buffer batches.
+// Detect a row-major VIEW or VP matrix from its forward vector.
+// In a row-major view matrix, the forward vector is column 3: (d[3],d[7],d[11]).
 bool LooksLikeVPMatrix(const float* d) {
     float fw = d[3]*d[3] + d[7]*d[7] + d[11]*d[11];
-    return (fw >= 0.81f && fw <= 1.21f);  // unit vector within ±10%
+    return (fw >= 0.81f && fw <= 1.21f);
+}
+
+// Wider check for SVSCF scan: the Blackbox Engine stores VP matrices at register 0
+// with row-major forward vector in row 2 (d[8],d[9],d[10]), scaled by projection
+// so squared length ranges from ~0.25 to ~1.0.
+bool LooksLikeVPOrProjectedMatrix(const float* d) {
+    // Standard column-3 check (UE3)
+    float fw_col3 = d[3]*d[3] + d[7]*d[7] + d[11]*d[11];
+    if (fw_col3 >= 0.81f && fw_col3 <= 1.21f) return true;
+    // Row-2 check for matrices where projection scaling is baked in
+    float fw_row2 = d[8]*d[8] + d[9]*d[9] + d[10]*d[10];
+    if (fw_row2 >= 0.20f && fw_row2 <= 1.05f) return true;
+    return false;
 }
 
 // Row-major 4x4 multiply: C = A * B
@@ -115,6 +128,255 @@ void BuildClipTileMatrix(uint32_t tx, uint32_t ty, uint32_t NX, uint32_t NY, D3D
     T.m[3][1] = 2.0f*float(ty) + 1.0f - float(NY);    // y offset (DX9 NDC +y=up)
 }
 
+struct VpCache {
+    bool haveOriginal = false;
+    float original[16] = {};
+
+    bool haveFreeCamUntiled = false;
+    float freeCamUntiled[16] = {};
+
+    bool haveFinalInjected = false;
+    float finalInjected[16] = {};
+};
+
+struct FreeCamRuntime {
+    bool active = false;
+
+    // last matrix the game uploaded at the identified VP register
+    bool haveOriginalVp = false;
+    float originalVp[16] = {};
+
+    // last matrix actually sent to the GPU after free-cam/tile processing
+    bool haveInjectedVp = false;
+    float injectedVp[16] = {};
+
+    // cached register chosen by the existing scan path
+    bool haveVpRegister = false;
+    UINT vpRegister = 0;
+
+    // optional fixed-function cache
+    bool haveOriginalProjection = false;
+    D3DMATRIX originalProjection = {};
+
+    // camera representation
+    bool initialized = false;
+    float cameraPos[3] = {0.0f, 0.0f, 0.0f};
+    float cameraRight[3] = {1.0f, 0.0f, 0.0f};
+    float cameraUp[3] = {0.0f, 1.0f, 0.0f};
+    float cameraForward[3] = {0.0f, 0.0f, 1.0f};
+    float worldUp[3] = {0.0f, 1.0f, 0.0f};
+
+    // projection params
+    float w = 1.0f;
+    float h = 1.0f;
+    float a = 1.0f;
+    float b = 0.0f;
+
+    // original camera position captured at initialization
+    float originalCameraPos[3] = {0.0f, 0.0f, 0.0f};
+    float originalRight[3] = {1.0f, 0.0f, 0.0f};
+    float originalUp[3] = {0.0f, 1.0f, 0.0f};
+    float originalForward[3] = {0.0f, 0.0f, 1.0f};
+
+    // UI diagnostic tracking
+    bool substitutionHappened = false;
+};
+
+static FreeCamRuntime gFreeCam;
+
+// Track the current world matrix set by the game via SetTransform.
+// Used in SVSCF_Hook to detect player model draws (identity world).
+static D3DMATRIX s_currentWorld = {};
+static bool s_hasWorld = false;
+
+// Math Helpers for Free Camera
+
+bool DecomposeVPMatrix(const float* M, float& w, float& h, float& a, float& b, D3DMATRIX& V) {
+    double A = (double)M[0] * M[0];
+    double B = (double)M[1] * M[1];
+    double C = 1.0 - (double)M[3] * M[3];
+    double D = (double)M[8] * M[8];
+    double E = (double)M[9] * M[9];
+    double F = 1.0 - (double)M[11] * M[11];
+
+    double det = A * E - B * D;
+    double x = 1.0;
+    double y = 1.0;
+    bool solved = false;
+    if (std::abs(det) > 1e-7) {
+        x = (C * E - B * F) / det;
+        y = (A * F - C * D) / det;
+        if (x > 1e-5 && y > 1e-5) {
+            w = (float)(1.0 / std::sqrt(x));
+            h = (float)(1.0 / std::sqrt(y));
+            solved = true;
+        }
+    }
+
+    if (!solved) {
+        double len0 = A + B;
+        double len1 = D + E;
+        if (len0 > 1e-5 && len1 > 1e-5 && C > 1e-5 && F > 1e-5) {
+            w = (float)(std::sqrt(len0 / C));
+            h = (float)(std::sqrt(len1 / F));
+            solved = true;
+        } else {
+            w = 1.0f;
+            h = 1.0f;
+        }
+    }
+
+    float V_mat[4][4] = {};
+    for (int i = 0; i < 4; ++i) {
+        V_mat[i][0] = M[i * 4 + 0] / w;
+        V_mat[i][1] = M[i * 4 + 1] / h;
+        V_mat[i][2] = M[i * 4 + 3];
+        V_mat[i][3] = (i == 3) ? 1.0f : 0.0f;
+    }
+
+    int bestRow = 0;
+    float maxVal = std::abs(M[3]);
+    if (std::abs(M[7]) > maxVal) { bestRow = 1; maxVal = std::abs(M[7]); }
+    if (std::abs(M[11]) > maxVal) { bestRow = 2; maxVal = std::abs(M[11]); }
+
+    if (maxVal > 1e-5) {
+        a = M[bestRow * 4 + 2] / M[bestRow * 4 + 3];
+    } else {
+        a = 1.0f;
+    }
+    b = M[14] - M[15] * a;
+
+    std::memcpy(V.m, V_mat, sizeof(V_mat));
+    return solved;
+}
+
+void Orthonormalize(D3DMATRIX& V) {
+    float r[3] = { V.m[0][0], V.m[0][1], V.m[0][2] };
+    float u[3] = { V.m[1][0], V.m[1][1], V.m[1][2] };
+    float f[3] = { V.m[2][0], V.m[2][1], V.m[2][2] };
+
+    float lenF = std::sqrt(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+    if (lenF > 1e-5f) { f[0] /= lenF; f[1] /= lenF; f[2] /= lenF; }
+
+    float crossR[3] = {
+        u[1]*f[2] - u[2]*f[1],
+        u[2]*f[0] - u[0]*f[2],
+        u[0]*f[1] - u[1]*f[0]
+    };
+    float lenR = std::sqrt(crossR[0]*crossR[0] + crossR[1]*crossR[1] + crossR[2]*crossR[2]);
+    if (lenR > 1e-5f) { r[0] = crossR[0] / lenR; r[1] = crossR[1] / lenR; r[2] = crossR[2] / lenR; }
+
+    u[0] = f[1]*r[2] - f[2]*r[1];
+    u[1] = f[2]*r[0] - f[0]*r[2];
+    u[2] = f[0]*r[1] - f[1]*r[0];
+
+    V.m[0][0] = r[0]; V.m[0][1] = r[1]; V.m[0][2] = r[2];
+    V.m[1][0] = u[0]; V.m[1][1] = u[1]; V.m[1][2] = u[2];
+    V.m[2][0] = f[0]; V.m[2][1] = f[1]; V.m[2][2] = f[2];
+}
+
+void RotateVector(const float axis[3], float angle, float v[3]) {
+    float cosA = std::cos(angle);
+    float sinA = std::sin(angle);
+    float cross[3] = {
+        axis[1]*v[2] - axis[2]*v[1],
+        axis[2]*v[0] - axis[0]*v[2],
+        axis[0]*v[1] - axis[1]*v[0]
+    };
+    float dot = axis[0]*v[0] + axis[1]*v[1] + axis[2]*v[2];
+    v[0] = v[0] * cosA + cross[0] * sinA + axis[0] * dot * (1.0f - cosA);
+    v[1] = v[1] * cosA + cross[1] * sinA + axis[1] * dot * (1.0f - cosA);
+    v[2] = v[2] * cosA + cross[2] * sinA + axis[2] * dot * (1.0f - cosA);
+}
+
+bool BuildLimitedFreeCameraVpFromOriginal(
+    const float* originalVp,
+    FreeCamRuntime& cam,
+    float* outVp)
+{
+    if (!cam.initialized) {
+        float w, h, a, b;
+        D3DMATRIX V;
+        if (DecomposeVPMatrix(originalVp, w, h, a, b, V)) {
+            Orthonormalize(V);
+
+            cam.cameraPos[0] = -(V.m[3][0] * V.m[0][0] + V.m[3][1] * V.m[1][0] + V.m[3][2] * V.m[2][0]);
+            cam.cameraPos[1] = -(V.m[3][0] * V.m[0][1] + V.m[3][1] * V.m[1][1] + V.m[3][2] * V.m[2][1]);
+            cam.cameraPos[2] = -(V.m[3][0] * V.m[0][2] + V.m[3][1] * V.m[1][2] + V.m[3][2] * V.m[2][2]);
+
+            cam.cameraRight[0] = V.m[0][0]; cam.cameraRight[1] = V.m[0][1]; cam.cameraRight[2] = V.m[0][2];
+            cam.cameraUp[0]    = V.m[1][0]; cam.cameraUp[1]    = V.m[1][1]; cam.cameraUp[2]    = V.m[1][2];
+            cam.cameraForward[0] = V.m[2][0]; cam.cameraForward[1] = V.m[2][1]; cam.cameraForward[2] = V.m[2][2];
+
+            cam.worldUp[0] = V.m[1][0];
+            cam.worldUp[1] = V.m[1][1];
+            cam.worldUp[2] = V.m[1][2];
+
+            cam.originalCameraPos[0] = cam.cameraPos[0];
+            cam.originalCameraPos[1] = cam.cameraPos[1];
+            cam.originalCameraPos[2] = cam.cameraPos[2];
+            cam.originalRight[0] = cam.cameraRight[0];
+            cam.originalRight[1] = cam.cameraRight[1];
+            cam.originalRight[2] = cam.cameraRight[2];
+            cam.originalUp[0] = cam.cameraUp[0];
+            cam.originalUp[1] = cam.cameraUp[1];
+            cam.originalUp[2] = cam.cameraUp[2];
+            cam.originalForward[0] = cam.cameraForward[0];
+            cam.originalForward[1] = cam.cameraForward[1];
+            cam.originalForward[2] = cam.cameraForward[2];
+
+            cam.w = w;
+            cam.h = h;
+            cam.a = a;
+            cam.b = b;
+
+            cam.initialized = true;
+            CaptureLog("BuildLimitedFreeCameraVpFromOriginal: Initialized camera position & projection");
+        } else {
+            CaptureLog("BuildLimitedFreeCameraVpFromOriginal: Decomposition failed, using original matrix");
+            std::memcpy(outVp, originalVp, 16 * sizeof(float));
+            return false;
+        }
+    }
+
+    float t_prime[3];
+    t_prime[0] = -(cam.cameraPos[0] * cam.cameraRight[0] + cam.cameraPos[1] * cam.cameraRight[1] + cam.cameraPos[2] * cam.cameraRight[2]);
+    t_prime[1] = -(cam.cameraPos[0] * cam.cameraUp[0] + cam.cameraPos[1] * cam.cameraUp[1] + cam.cameraPos[2] * cam.cameraUp[2]);
+    t_prime[2] = -(cam.cameraPos[0] * cam.cameraForward[0] + cam.cameraPos[1] * cam.cameraForward[1] + cam.cameraPos[2] * cam.cameraForward[2]);
+
+    D3DMATRIX M_prime;
+    M_prime.m[0][0] = cam.cameraRight[0] * cam.w;
+    M_prime.m[0][1] = cam.cameraRight[1] * cam.h;
+    M_prime.m[0][2] = cam.cameraRight[2] * cam.a;
+    M_prime.m[0][3] = cam.cameraRight[2];
+
+    M_prime.m[1][0] = cam.cameraUp[0] * cam.w;
+    M_prime.m[1][1] = cam.cameraUp[1] * cam.h;
+    M_prime.m[1][2] = cam.cameraUp[2] * cam.a;
+    M_prime.m[1][3] = cam.cameraUp[2];
+
+    M_prime.m[2][0] = cam.cameraForward[0] * cam.w;
+    M_prime.m[2][1] = cam.cameraForward[1] * cam.h;
+    M_prime.m[2][2] = cam.cameraForward[2] * cam.a;
+    M_prime.m[2][3] = cam.cameraForward[2];
+
+    M_prime.m[3][0] = t_prime[0] * cam.w;
+    M_prime.m[3][1] = t_prime[1] * cam.h;
+    M_prime.m[3][2] = t_prime[2] * cam.a + cam.b;
+    M_prime.m[3][3] = t_prime[2];
+
+    std::memcpy(outVp, M_prime.m, 16 * sizeof(float));
+    return true;
+}
+
+void PostMultiplyRowMajor4x4(const float* A, const float* B, float* C) {
+    D3DMATRIX matA, matB, matC;
+    std::memcpy(matA.m, A, 16 * sizeof(float));
+    std::memcpy(matB.m, B, 16 * sizeof(float));
+    MatMul4x4(matA, matB, matC);
+    std::memcpy(C, matC.m, 16 * sizeof(float));
+}
+
 struct CaptureContext {
     bool active = false;
     bool gotOriginalProjection = false;
@@ -136,6 +398,7 @@ struct CaptureContext {
     // correct original frustum rather than our tile-shifted one.
     D3DMATRIX originalVPData = {};
     bool hasOriginalVPData = false;
+    VpCache vpCache;
 };
 
 CaptureContext g_capture;
@@ -184,7 +447,7 @@ void FinalizeCapture() {
     g_capture.active = false;
     g_capture.currentTile = 0;
     g_capture.gotOriginalProjection = false;
-    g_capture.projConstantRegister = -1;
+    // Keep projConstantRegister — free-cam and subsequent captures reuse it.
     g_capture.scanningForProjection = false;
     Core::Instance().SetState(saved ? CaptureState::Idle : CaptureState::Error);
 }
@@ -495,17 +758,69 @@ HRESULT WINAPI SetTransform_Hook(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE
             CaptureLog("ST_DUMP complete (10 calls)");
         }
     }
-    if (state == D3DTS_PROJECTION && g_capture.active && matrix != nullptr && LooksLikeVPMatrix((const float*)matrix->m)) {
-        std::lock_guard<std::recursive_mutex> lock(g_capture.mutex);
 
-        if (!g_capture.gotOriginalProjection) {
-            g_capture.gotOriginalProjection = true;
-            g_capture.scanningForProjection = false;
-            CaptureLog("SetTransform_Hook: fixed-function projection, applying clip-tile");
+    if (matrix != nullptr) {
+        if (state == D3DTS_WORLD) {
+            s_currentWorld = *matrix;
+            s_hasWorld = true;
         }
-        D3DMATRIX tileMatrix;
-        ApplyClipTile((const float*)matrix->m, tileMatrix);
-        return SetTransform_Original(device, state, &tileMatrix);
+
+        if (state == D3DTS_VIEW) {
+            gFreeCam.haveOriginalProjection = true;
+            gFreeCam.originalProjection = *matrix;
+
+            if (gFreeCam.active) {
+                bool useShaderCamera = (g_capture.projConstantRegister >= 0 || gFreeCam.haveVpRegister);
+
+                // Only initialize/substitute for fixed-function games; shader-based
+                // games use the SVSCF path. Substituting D3DTS_VIEW during SVSCF
+                // mode causes engine CPU-side readbacks to see wrong values.
+                if (!useShaderCamera && !gFreeCam.initialized) {
+                    D3DMATRIX V = *matrix;
+                    if (std::abs(V.m[3][0]) + std::abs(V.m[3][1]) + std::abs(V.m[3][2]) > 0.01f) {
+                        gFreeCam.cameraPos[0] = -(V.m[3][0] * V.m[0][0] + V.m[3][1] * V.m[1][0] + V.m[3][2] * V.m[2][0]);
+                        gFreeCam.cameraPos[1] = -(V.m[3][0] * V.m[0][1] + V.m[3][1] * V.m[1][1] + V.m[3][2] * V.m[2][1]);
+                        gFreeCam.cameraPos[2] = -(V.m[3][0] * V.m[0][2] + V.m[3][1] * V.m[1][2] + V.m[3][2] * V.m[2][2]);
+                        gFreeCam.cameraRight[0] = V.m[0][0]; gFreeCam.cameraRight[1] = V.m[0][1]; gFreeCam.cameraRight[2] = V.m[0][2];
+                        gFreeCam.cameraUp[0]    = V.m[1][0]; gFreeCam.cameraUp[1]    = V.m[1][1]; gFreeCam.cameraUp[2]    = V.m[1][2];
+                        gFreeCam.cameraForward[0] = V.m[2][0]; gFreeCam.cameraForward[1] = V.m[2][1]; gFreeCam.cameraForward[2] = V.m[2][2];
+                        gFreeCam.worldUp[0] = V.m[1][0]; gFreeCam.worldUp[1] = V.m[1][1]; gFreeCam.worldUp[2] = V.m[1][2];
+                        gFreeCam.initialized = true;
+                        CaptureLog("SetTransform_Hook: Initialized camera position & axes from fixed-function D3DTS_VIEW");
+                    }
+                }
+
+                // Only substitute for fixed-function games; shader-based games use SVSCF path.
+                if (gFreeCam.initialized && !useShaderCamera) {
+                    float t_prime[3];
+                    t_prime[0] = -(gFreeCam.cameraPos[0] * gFreeCam.cameraRight[0] + gFreeCam.cameraPos[1] * gFreeCam.cameraRight[1] + gFreeCam.cameraPos[2] * gFreeCam.cameraRight[2]);
+                    t_prime[1] = -(gFreeCam.cameraPos[0] * gFreeCam.cameraUp[0] + gFreeCam.cameraPos[1] * gFreeCam.cameraUp[1] + gFreeCam.cameraPos[2] * gFreeCam.cameraUp[2]);
+                    t_prime[2] = -(gFreeCam.cameraPos[0] * gFreeCam.cameraForward[0] + gFreeCam.cameraPos[1] * gFreeCam.cameraForward[1] + gFreeCam.cameraPos[2] * gFreeCam.cameraForward[2]);
+
+                    D3DMATRIX V_prime;
+                    V_prime.m[0][0] = gFreeCam.cameraRight[0]; V_prime.m[0][1] = gFreeCam.cameraRight[1]; V_prime.m[0][2] = gFreeCam.cameraRight[2]; V_prime.m[0][3] = 0.0f;
+                    V_prime.m[1][0] = gFreeCam.cameraUp[0];    V_prime.m[1][1] = gFreeCam.cameraUp[1];    V_prime.m[1][2] = gFreeCam.cameraUp[2];    V_prime.m[1][3] = 0.0f;
+                    V_prime.m[2][0] = gFreeCam.cameraForward[0]; V_prime.m[2][1] = gFreeCam.cameraForward[1]; V_prime.m[2][2] = gFreeCam.cameraForward[2]; V_prime.m[2][3] = 0.0f;
+                    V_prime.m[3][0] = t_prime[0];              V_prime.m[3][1] = t_prime[1];              V_prime.m[3][2] = t_prime[2];              V_prime.m[3][3] = 1.0f;
+
+                    gFreeCam.substitutionHappened = true;
+                    return SetTransform_Original(device, state, &V_prime);
+                }
+            }
+        }
+
+        if (state == D3DTS_PROJECTION && g_capture.active && LooksLikeVPMatrix((const float*)matrix->m)) {
+            std::lock_guard<std::recursive_mutex> lock(g_capture.mutex);
+
+            if (!g_capture.gotOriginalProjection) {
+                g_capture.gotOriginalProjection = true;
+                g_capture.scanningForProjection = false;
+                CaptureLog("SetTransform_Hook: fixed-function projection, applying clip-tile");
+            }
+            D3DMATRIX tileMatrix;
+            ApplyClipTile((const float*)matrix->m, tileMatrix);
+            return SetTransform_Original(device, state, &tileMatrix);
+        }
     }
 
     return SetTransform_Original(device, state, matrix);
@@ -514,64 +829,107 @@ HRESULT WINAPI SetTransform_Hook(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE
 HRESULT WINAPI SetVertexShaderConstantF_Hook(IDirect3DDevice9* device, UINT startRegister,
                                              const float* constantData, UINT vector4fCount) {
     // All D3D hooks run on the render thread — no mutex needed here.
-    // Keep this hook as fast as possible: bail out immediately when not capturing.
-    if (!g_capture.active || !constantData) {
+    if ((!g_capture.active && !gFreeCam.active) || !constantData) {
+        return SetVertexShaderConstantF_Original(device, startRegister, constantData, vector4fCount);
+    }
+    // Fast-path: free-cam is on but this call is NOT the VP register.
+    if (!g_capture.active && gFreeCam.active && !g_capture.scanningForProjection &&
+        g_capture.projConstantRegister >= 0 &&
+        static_cast<int>(startRegister) != g_capture.projConstantRegister) {
         return SetVertexShaderConstantF_Original(device, startRegister, constantData, vector4fCount);
     }
 
-    // Diagnostic dump: log the first 50 SVSCF calls (any vector4fCount) to see
-    // all raw matrix data and identify the VP matrix.
-    static uint32_t s_dumpCount = 0;
-    static bool s_dumpDone = false;
-    if (g_capture.scanningForProjection && !s_dumpDone) {
-        if (s_dumpCount < 50) {
-            const float* d = constantData;
-            UINT dumpVecs = (vector4fCount < 4) ? vector4fCount : 4;
-            char buf[512];
-            if (dumpVecs == 4) {
-                sprintf_s(buf,
-                    "DUMP reg=%u vwc=%u  [%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f"
-                    " | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f]",
-                    startRegister, vector4fCount,
-                    d[0], d[1], d[2], d[3],
-                    d[4], d[5], d[6], d[7],
-                    d[8], d[9], d[10], d[11],
-                    d[12], d[13], d[14], d[15]);
-            } else {
-                sprintf_s(buf, "DUMP reg=%u vwc=%u (first %u vecs)",
-                    startRegister, vector4fCount, dumpVecs);
-                for (UINT v = 0; v < dumpVecs; ++v) {
-                    char tmp[64];
-                    sprintf_s(tmp, "  [%.4f %.4f %.4f %.4f]",
-                        d[v*4], d[v*4+1], d[v*4+2], d[v*4+3]);
-                    strcat_s(buf, tmp);
-                }
-            }
+    // Keep log reset triggers
+    static bool s_wasFreeCamActive = false;
+    static bool s_wasCaptureActive = false;
+    static bool s_loggedOriginalCache = false;
+    static bool s_loggedSubst = false;
+    static bool s_loggedTile = false;
+
+    // Diagnostic: count SVSCF calls that reach the slow-path vs. early-return
+    // during free-cam idle. Logs once per 10000 non-fast-path calls.
+    static uint32_t s_diagCallCount = 0;
+    if (gFreeCam.active && g_capture.projConstantRegister >= 0) {
+        ++s_diagCallCount;
+        if (s_diagCallCount % 10000 == 0) {
+            char buf[128];
+            sprintf_s(buf, "SVSCF_DIAG: free-cam active, %u calls reached hook body (non-fast-path)",
+                      s_diagCallCount);
             CaptureLog(buf);
-        }
-        if (++s_dumpCount == 50) {
-            s_dumpDone = true;
-            CaptureLog("DUMP complete (50 calls)");
         }
     }
 
-    // Scanning phase: search up to 4096 constant uploads per capture for the projection matrix.
-    if (g_capture.scanningForProjection) {
-        if (s_scanCallBudget == 0) {
+    if (gFreeCam.active != s_wasFreeCamActive) {
+        s_wasFreeCamActive = gFreeCam.active;
+        s_loggedSubst = false;
+        s_loggedOriginalCache = false;
+        CaptureLog(gFreeCam.active ? "SVSCF_Hook: Free camera active, reset logging flags" : "SVSCF_Hook: Free camera inactive, reset logging flags");
+    }
+    if (g_capture.active != s_wasCaptureActive) {
+        s_wasCaptureActive = g_capture.active;
+        s_loggedTile = false;
+        CaptureLog(g_capture.active ? "SVSCF_Hook: Capture active, reset logging flags" : "SVSCF_Hook: Capture inactive, reset logging flags");
+    }
+
+    // Diagnostic dump: log all vwc==4 calls with their forward-vector squared length
+    // so we can identify the VP matrix pattern for non-UE3 engines.
+    static uint32_t s_dumpCount = 0;
+    if (g_capture.scanningForProjection && s_dumpCount < 200) {
+        const float* d = constantData;
+        if (vector4fCount == 4) {
+            float fw2 = d[3]*d[3] + d[7]*d[7] + d[11]*d[11];
+            float fw2_col = d[2]*d[2] + d[6]*d[6] + d[10]*d[10];
+            char buf[512];
+            sprintf_s(buf,
+                "DUMP[%u] reg=%u fw2=%.4f fw2_col=%.4f"
+                "  [%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f"
+                " | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f]",
+                s_dumpCount, startRegister, fw2, fw2_col,
+                d[0], d[1], d[2], d[3],
+                d[4], d[5], d[6], d[7],
+                d[8], d[9], d[10], d[11],
+                d[12], d[13], d[14], d[15]);
+            CaptureLog(buf);
+            ++s_dumpCount;
+        } else if (s_dumpCount < 200) {
+            if (s_dumpCount < 50 && (vector4fCount == 3 || vector4fCount == 6)) {
+                char buf[256];
+                sprintf_s(buf, "DUMP[%u] reg=%u vwc=%u (non-4)", s_dumpCount, startRegister, vector4fCount);
+                CaptureLog(buf);
+                ++s_dumpCount;
+            }
+        }
+    }
+
+    // Scanning phase: search up to 4096 constant uploads for the projection matrix.
+    if (g_capture.projConstantRegister < 0) {
+        if (g_capture.scanningForProjection && s_scanCallBudget == 0) {
             s_scanCallBudget = 4096;
         }
         if (s_scanCallBudget > 0) {
             --s_scanCallBudget;
-            if (vector4fCount == 4 && LooksLikeVPMatrix(constantData)) {
+            if (vector4fCount == 4 && LooksLikeVPOrProjectedMatrix(constantData)) {
                 g_capture.projConstantRegister = static_cast<int>(startRegister);
                 g_capture.gotOriginalProjection = true;
                 g_capture.scanningForProjection = false;
                 g_capture.vpFoundTick = GetTickCount64();
+                
+                gFreeCam.haveVpRegister = true;
+                gFreeCam.vpRegister = startRegister;
+
                 s_scanCallBudget = 0;
-                char buf[64];
-                sprintf_s(buf, "SVSCF_Hook: found VP matrix at register %d",
-                          g_capture.projConstantRegister);
+                char buf[128];
+                sprintf_s(buf, "SVSCF_Hook: found VP matrix at register %d", g_capture.projConstantRegister);
                 CaptureLog(buf);
+            } else if (vector4fCount == 4) {
+                float fw2 = constantData[3]*constantData[3] + constantData[7]*constantData[7] + constantData[11]*constantData[11];
+                float fw2_col = constantData[2]*constantData[2] + constantData[6]*constantData[6] + constantData[10]*constantData[10];
+                if ((fw2 > 0.5f && fw2 < 2.0f) || (fw2_col > 0.5f && fw2_col < 2.0f)) {
+                    char buf[128];
+                    sprintf_s(buf, "SVSCF_Hook: close call at reg=%u fw2=%.4f fw2_col=%.4f",
+                              startRegister, fw2, fw2_col);
+                    CaptureLog(buf);
+                }
             }
             if (s_scanCallBudget == 0 && g_capture.scanningForProjection) {
                 g_capture.scanningForProjection = false;
@@ -582,22 +940,91 @@ HRESULT WINAPI SetVertexShaderConstantF_Hook(IDirect3DDevice9* device, UINT star
         s_scanCallBudget = 0;
     }
 
-    // Injection phase: exact-match only — startRegister matches detected register,
-    // call uploads exactly 4 vectors (one matrix), and the matrix still looks like a
-    // camera VP matrix (so we don't corrupt HUD/orthographic uploads on later passes).
-    if (g_capture.gotOriginalProjection &&
-        g_capture.projConstantRegister >= 0 &&
+    // Injection / Substitution phase
+    if (g_capture.projConstantRegister >= 0 &&
         static_cast<int>(startRegister) == g_capture.projConstantRegister &&
-        vector4fCount == 4 &&
-        LooksLikeVPMatrix(constantData)) {
-        // Save the original VP each frame so GetVertexShaderConstantF_Hook can
-        // return it to the engine's CPU-side frustum culler.
+        vector4fCount >= 4 &&
+        LooksLikeVPOrProjectedMatrix(constantData))
+    {
+        // 3. Cache original uploaded matrix
+        std::memcpy(g_capture.vpCache.original, constantData, 16 * sizeof(float));
+        g_capture.vpCache.haveOriginal = true;
+        
+        if (!s_loggedOriginalCache) {
+            s_loggedOriginalCache = true;
+            CaptureLog("SVSCF_Hook: Original VP matrix cached");
+        }
+
         std::memcpy(g_capture.originalVPData.m, constantData, 16 * sizeof(float));
         g_capture.hasOriginalVPData = true;
-        D3DMATRIX tileMatrix;
-        ApplyClipTile(constantData, tileMatrix);
-        return SetVertexShaderConstantF_Original(device, startRegister,
-                                                 reinterpret_cast<const float*>(tileMatrix.m), 4);
+
+        float working[16];
+        std::memcpy(working, constantData, 16 * sizeof(float));
+
+        gFreeCam.substitutionHappened = false;
+
+        // 4. Apply limited free-camera override first
+        if (gFreeCam.active) {
+            if (BuildLimitedFreeCameraVpFromOriginal(g_capture.vpCache.original, gFreeCam, working)) {
+                // Check if current world matrix is identity (player model draw).
+                // Player model at identity world should stay at its original camera
+                // position rather than following the free-cam. We pre-multiply the
+                // freecam VP by a translation to the original camera position.
+                bool isIdentityWorld = true;
+                if (s_hasWorld) {
+                    const float* w = (const float*)s_currentWorld.m;
+                    for (int i = 0; i < 16 && isIdentityWorld; ++i) {
+                        float expected = (i % 5 == 0) ? 1.0f : 0.0f;
+                        if (std::abs(w[i] - expected) > 1e-4f) isIdentityWorld = false;
+                    }
+                }
+                if (isIdentityWorld && gFreeCam.initialized) {
+                    D3DMATRIX trans;
+                    memset(&trans, 0, sizeof(trans));
+                    trans.m[0][0] = 1.0f; trans.m[1][1] = 1.0f;
+                    trans.m[2][2] = 1.0f; trans.m[3][3] = 1.0f;
+                    trans.m[3][0] = gFreeCam.originalCameraPos[0];
+                    trans.m[3][1] = gFreeCam.originalCameraPos[1];
+                    trans.m[3][2] = gFreeCam.originalCameraPos[2];
+                    PostMultiplyRowMajor4x4((const float*)trans.m, working, working);
+                }
+
+                std::memcpy(g_capture.vpCache.freeCamUntiled, working, 16 * sizeof(float));
+                g_capture.vpCache.haveFreeCamUntiled = true;
+                gFreeCam.substitutionHappened = true;
+
+                if (!s_loggedSubst) {
+                    s_loggedSubst = true;
+                    CaptureLog("SVSCF_Hook: Free camera matrix substituted");
+                }
+            }
+        } else {
+            g_capture.vpCache.haveFreeCamUntiled = false;
+        }
+
+        // 5. Apply tile matrix second
+        if (g_capture.active) {
+            D3DMATRIX tileMtx;
+            const uint32_t tileX = g_capture.currentTile % g_capture.tileCountX;
+            const uint32_t tileY = g_capture.currentTile / g_capture.tileCountX;
+            BuildClipTileMatrix(tileX, tileY, g_capture.tileCountX, g_capture.tileCountY, tileMtx);
+            PostMultiplyRowMajor4x4(working, reinterpret_cast<const float*>(tileMtx.m), working);
+
+            if (!s_loggedTile) {
+                s_loggedTile = true;
+                CaptureLog("SVSCF_Hook: Tile post-multiply applied");
+            }
+        }
+
+        std::memcpy(g_capture.vpCache.finalInjected, working, 16 * sizeof(float));
+        g_capture.vpCache.haveFinalInjected = true;
+
+        // 6. Send final matrix to GPU
+        HRESULT hr = SetVertexShaderConstantF_Original(device, startRegister, working, 4);
+        if (vector4fCount > 4) {
+            SetVertexShaderConstantF_Original(device, startRegister + 4, constantData + 16, vector4fCount - 4);
+        }
+        return hr;
     }
 
     return SetVertexShaderConstantF_Original(device, startRegister, constantData, vector4fCount);
@@ -614,7 +1041,7 @@ HRESULT WINAPI GetVertexShaderConstantF_Hook(IDirect3DDevice9* device, UINT star
     HRESULT hr = GetVertexShaderConstantF_Original(device, startRegister, constantData, vector4fCount);
     if (FAILED(hr)) return hr;
 
-    if (g_capture.active && g_capture.hasOriginalVPData && g_capture.projConstantRegister >= 0 && constantData) {
+    if (g_capture.vpCache.haveOriginal && g_capture.projConstantRegister >= 0 && constantData) {
         const UINT R = static_cast<UINT>(g_capture.projConstantRegister);
         const UINT intersectStart = (std::max)(R, startRegister);
         const UINT intersectEnd = (std::min)(R + 4, startRegister + vector4fCount);
@@ -622,12 +1049,16 @@ HRESULT WINAPI GetVertexShaderConstantF_Hook(IDirect3DDevice9* device, UINT star
             const UINT numVectors = intersectEnd - intersectStart;
             const UINT srcOffset = (intersectStart - R) * 4;
             const UINT destOffset = (intersectStart - startRegister) * 4;
-            std::memcpy(constantData + destOffset, (const float*)g_capture.originalVPData.m + srcOffset, numVectors * 4 * sizeof(float));
+            std::memcpy(constantData + destOffset, g_capture.vpCache.original + srcOffset, numVectors * 4 * sizeof(float));
 
-            char buf[128];
-            sprintf_s(buf, "GetVertexShaderConstantF_Hook: intercepted R=%u, range=[%u, %u), copied %u vecs",
-                      R, startRegister, startRegister + vector4fCount, numVectors);
-            CaptureLog(buf);
+            static bool s_loggedGvsc = false;
+            if (!s_loggedGvsc) {
+                s_loggedGvsc = true;
+                char buf[128];
+                sprintf_s(buf, "GetVertexShaderConstantF_Hook: intercepted R=%u, range=[%u, %u), copied %u vecs (returned cached original)",
+                          R, startRegister, startRegister + vector4fCount, numVectors);
+                CaptureLog(buf);
+            }
         }
     }
     return hr;
@@ -648,7 +1079,7 @@ HRESULT WINAPI SetPixelShaderConstantF_Hook(IDirect3DDevice9* device, UINT start
         }
         if (s_scanCallBudget > 0) {
             --s_scanCallBudget;
-            if (vector4fCount == 4 && LooksLikeVPMatrix(constantData)) {
+            if (vector4fCount == 4 && LooksLikeVPOrProjectedMatrix(constantData)) {
                 g_capture.projConstantRegister = static_cast<int>(startRegister);
                 g_capture.gotOriginalProjection = true;
                 g_capture.scanningForProjection = false;
@@ -673,7 +1104,7 @@ HRESULT WINAPI SetPixelShaderConstantF_Hook(IDirect3DDevice9* device, UINT start
         g_capture.projConstantRegister >= 0 &&
         static_cast<int>(startRegister) == g_capture.projConstantRegister &&
         vector4fCount == 4 &&
-        LooksLikeVPMatrix(constantData)) {
+        LooksLikeVPOrProjectedMatrix(constantData)) {
         D3DMATRIX tileMatrix;
         ApplyClipTile(constantData, tileMatrix);
         return SetPixelShaderConstantF_Original(device, startRegister,
@@ -684,26 +1115,148 @@ HRESULT WINAPI SetPixelShaderConstantF_Hook(IDirect3DDevice9* device, UINT start
 }
 
 void DoCaptureFrame(IDirect3DDevice9* device, IDirect3DSurface9* bb); // forward declaration
+void TryHookSwapChain(IDirect3DDevice9* device); // forward declaration
+
+bool IsFreeCamHotkeyPressed() {
+    static bool s_wasDown = false;
+    bool isDown = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    bool pressed = isDown && !s_wasDown;
+    s_wasDown = isDown;
+    return pressed;
+}
+
+void PollFreeCamToggle() {
+    if (IsFreeCamHotkeyPressed()) {
+        Core& core = Core::Instance();
+        FreeCamConfig cfg = core.GetFreeCamConfig();
+        cfg.enabled = !cfg.enabled;
+        core.SetFreeCamConfig(cfg);
+        char buf[128];
+        sprintf_s(buf, "PollFreeCamToggle: Free camera toggled to %s", cfg.enabled ? "ENABLED" : "DISABLED");
+        CaptureLog(buf);
+    }
+}
+
+void UpdateFreeCamFromInput() {
+    static auto lastTime = std::chrono::high_resolution_clock::now();
+
+    bool freeCamEnabled = Core::Instance().GetFreeCamConfig().enabled;
+    if (freeCamEnabled != gFreeCam.active) {
+        gFreeCam.active = freeCamEnabled;
+        if (gFreeCam.active) {
+            gFreeCam.initialized = false;
+            lastTime = std::chrono::high_resolution_clock::now();
+            // Trigger VP register scan if no capture has found it yet.
+            if (g_capture.projConstantRegister < 0 && !g_capture.scanningForProjection) {
+                g_capture.scanningForProjection = true;
+                CaptureLog("UpdateFreeCamFromInput: Starting VP register scan for free-cam");
+            }
+        }
+    }
+
+    if (!gFreeCam.active) return;
+
+    auto now = std::chrono::high_resolution_clock::now();
+    float dt = std::chrono::duration<float>(now - lastTime).count();
+    lastTime = now;
+    if (dt > 0.1f) dt = 0.1f;
+
+    FreeCamConfig cfg = Core::Instance().GetFreeCamConfig();
+
+    if (!gFreeCam.initialized) return;
+
+    float moveSpeed = 500.0f * cfg.moveSpeed;
+    float lookSpeed = 1.0f * cfg.lookSpeed;
+
+    float pitchDelta = 0.0f;
+    float yawDelta = 0.0f;
+
+    if (GetAsyncKeyState(VK_UP) & 0x8000)    pitchDelta -= lookSpeed * dt;
+    if (GetAsyncKeyState(VK_DOWN) & 0x8000)  pitchDelta += lookSpeed * dt;
+    if (GetAsyncKeyState(VK_LEFT) & 0x8000)  yawDelta -= lookSpeed * dt;
+    if (GetAsyncKeyState(VK_RIGHT) & 0x8000) yawDelta += lookSpeed * dt;
+
+    float moveForward = 0.0f;
+    float moveRight = 0.0f;
+    float moveUp = 0.0f;
+
+    if (GetAsyncKeyState('W') & 0x8000) moveForward += moveSpeed * dt;
+    if (GetAsyncKeyState('S') & 0x8000) moveForward -= moveSpeed * dt;
+    if (GetAsyncKeyState('D') & 0x8000) moveRight += moveSpeed * dt;
+    if (GetAsyncKeyState('A') & 0x8000) moveRight -= moveSpeed * dt;
+    if (GetAsyncKeyState('R') & 0x8000) moveUp += moveSpeed * dt;
+    if (GetAsyncKeyState('F') & 0x8000) moveUp -= moveSpeed * dt;
+    if (GetAsyncKeyState(VK_SPACE) & 0x8000) moveUp += moveSpeed * dt;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) moveUp -= moveSpeed * dt;
+
+    if (std::abs(yawDelta) > 1e-6f) {
+        RotateVector(gFreeCam.worldUp, yawDelta, gFreeCam.cameraRight);
+        RotateVector(gFreeCam.worldUp, yawDelta, gFreeCam.cameraForward);
+        RotateVector(gFreeCam.worldUp, yawDelta, gFreeCam.cameraUp);
+    }
+    if (std::abs(pitchDelta) > 1e-6f) {
+        RotateVector(gFreeCam.cameraRight, pitchDelta, gFreeCam.cameraForward);
+        RotateVector(gFreeCam.cameraRight, pitchDelta, gFreeCam.cameraUp);
+    }
+
+    float lenF = std::sqrt(gFreeCam.cameraForward[0]*gFreeCam.cameraForward[0] + gFreeCam.cameraForward[1]*gFreeCam.cameraForward[1] + gFreeCam.cameraForward[2]*gFreeCam.cameraForward[2]);
+    if (lenF > 1e-5f) {
+        gFreeCam.cameraForward[0] /= lenF;
+        gFreeCam.cameraForward[1] /= lenF;
+        gFreeCam.cameraForward[2] /= lenF;
+    }
+    gFreeCam.cameraRight[0] = gFreeCam.worldUp[1] * gFreeCam.cameraForward[2] - gFreeCam.worldUp[2] * gFreeCam.cameraForward[1];
+    gFreeCam.cameraRight[1] = gFreeCam.worldUp[2] * gFreeCam.cameraForward[0] - gFreeCam.worldUp[0] * gFreeCam.cameraForward[2];
+    gFreeCam.cameraRight[2] = gFreeCam.worldUp[0] * gFreeCam.cameraForward[1] - gFreeCam.worldUp[1] * gFreeCam.cameraForward[0];
+    float lenR = std::sqrt(gFreeCam.cameraRight[0]*gFreeCam.cameraRight[0] + gFreeCam.cameraRight[1]*gFreeCam.cameraRight[1] + gFreeCam.cameraRight[2]*gFreeCam.cameraRight[2]);
+    if (lenR > 1e-5f) {
+        gFreeCam.cameraRight[0] /= lenR;
+        gFreeCam.cameraRight[1] /= lenR;
+        gFreeCam.cameraRight[2] /= lenR;
+    }
+    gFreeCam.cameraUp[0] = gFreeCam.cameraForward[1] * gFreeCam.cameraRight[2] - gFreeCam.cameraForward[2] * gFreeCam.cameraRight[1];
+    gFreeCam.cameraUp[1] = gFreeCam.cameraForward[2] * gFreeCam.cameraRight[0] - gFreeCam.cameraForward[0] * gFreeCam.cameraRight[2];
+    gFreeCam.cameraUp[2] = gFreeCam.cameraForward[0] * gFreeCam.cameraRight[1] - gFreeCam.cameraForward[1] * gFreeCam.cameraRight[0];
+
+    gFreeCam.cameraPos[0] += gFreeCam.cameraForward[0] * moveForward + gFreeCam.cameraRight[0] * moveRight + gFreeCam.cameraUp[0] * moveUp;
+    gFreeCam.cameraPos[1] += gFreeCam.cameraForward[1] * moveForward + gFreeCam.cameraRight[1] * moveRight + gFreeCam.cameraUp[1] * moveUp;
+    gFreeCam.cameraPos[2] += gFreeCam.cameraForward[2] * moveForward + gFreeCam.cameraRight[2] * moveRight + gFreeCam.cameraUp[2] * moveUp;
+}
+
+FreeCamStatusInfo QueryFreeCamStatus() {
+    FreeCamStatusInfo info;
+    info.active = gFreeCam.active;
+    info.vpRegisterTracked = gFreeCam.haveVpRegister;
+    info.vpRegister = gFreeCam.haveVpRegister ? static_cast<int>(gFreeCam.vpRegister) : -1;
+    info.substitutionHappened = gFreeCam.substitutionHappened;
+    info.cameraPos[0] = gFreeCam.cameraPos[0];
+    info.cameraPos[1] = gFreeCam.cameraPos[1];
+    info.cameraPos[2] = gFreeCam.cameraPos[2];
+    return info;
+}
 
 HRESULT WINAPI EndScene_Hook(IDirect3DDevice9* device) {
     static uint32_t s_callCount = 0;
     if (++s_callCount == 1) {
         CaptureLog("EndScene_Hook: first call - hooks active");
     }
+    PollFreeCamToggle();
+    UpdateFreeCamFromInput();
+
     UpdateHotkey();
     StartCaptureIfRequested();
 
     // Fallback: if Present is not being called after VP injection (e.g. the game's
     // render loop aborts the frame on some rendering paths such as the main menu),
-    // capture from EndScene instead.  A 100ms grace period lets Present fire first
-    // in normal gameplay; only if Present stays silent do we take over here.
+    // capture from EndScene instead.  Longer timeouts to avoid reading a blank buffer
+    // before the game has rendered into it.
     if (g_capture.active && g_capture.gotOriginalProjection && !g_capture.scanningForProjection) {
         const uint64_t now = GetTickCount64();
         const bool firstTileOverdue  = (g_capture.currentTile == 0) &&
                                        (g_capture.vpFoundTick > 0) &&
-                                       (now - g_capture.vpFoundTick > 100);
+                                       (now - g_capture.vpFoundTick > 500);
         const bool nextTileOverdue   = (g_capture.currentTile > 0) &&
-                                       (now - g_capture.lastCaptureTick > 200);
+                                       (now - g_capture.lastCaptureTick > 1000);
         if (firstTileOverdue || nextTileOverdue) {
             IDirect3DSurface9* bb = nullptr;
             if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
@@ -714,9 +1267,16 @@ HRESULT WINAPI EndScene_Hook(IDirect3DDevice9* device) {
         }
     }
 
-    // ImGui overlay: render on top of the fully-composed frame, before EndScene
-    // hands off to the driver.  The overlay is a no-op when not initialised.
-    RenderOverlay();
+    // Render ImGui overlay here as well, inside the game's EndScene (guarded by the shared tick).
+    // This handles cases where Present hooks are bypassed by Steam overlay or other factors,
+    // and since it runs inside the main EndScene, it has a valid rendering context.
+    {
+        const uint64_t now = GetTickCount64();
+        if (now != s_lastOverlayTick) {
+            s_lastOverlayTick = now;
+            RenderOverlay();
+        }
+    }
 
     return EndScene_Original(device);
 }
@@ -786,20 +1346,26 @@ void DoCaptureFrame(IDirect3DDevice9* device, IDirect3DSurface9* bb) {
     }
 }
 
+static bool s_swapChainHooked = false;
+
+void TryHookSwapChain(IDirect3DDevice9* device) {
+    if (s_swapChainHooked || !device) return;
+    IDirect3DSwapChain9* sc = nullptr;
+    if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
+        void** scVtable = *reinterpret_cast<void***>(sc);
+        if (MH_CreateHook(scVtable[3], &SwapChainPresent_Hook,
+                          reinterpret_cast<void**>(&SwapChainPresent_Original)) == MH_OK) {
+            MH_EnableHook(scVtable[3]);
+            s_swapChainHooked = true;
+            CaptureLog("TryHookSwapChain: swap chain Present hooked");
+        }
+        sc->Release();
+    }
+}
+
 HRESULT WINAPI Present_Hook(IDirect3DDevice9* device, const RECT* sourceRect, const RECT* destRect,
                             HWND destWindowOverride, const RGNDATA* dirtyRegion) {
-    static bool s_swapChainHooked = false;
-    if (!s_swapChainHooked) {
-        s_swapChainHooked = true;
-        CaptureLog("Present_Hook: first call (device path), hooking swap chain");
-        IDirect3DSwapChain9* sc = nullptr;
-        if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
-            HookSwapChainPresent(sc);
-            sc->Release();
-        } else {
-            CaptureLog("Present_Hook: GetSwapChain failed");
-        }
-    }
+    TryHookSwapChain(device);
 
     if (g_capture.active) {
         // Capture BEFORE Present so the backbuffer still holds the rendered frame.
@@ -812,6 +1378,22 @@ HRESULT WINAPI Present_Hook(IDirect3DDevice9* device, const RECT* sourceRect, co
             g_capture.writer.reset();
             g_capture.active = false;
             Core::Instance().SetState(CaptureState::Idle);
+        }
+    }
+
+    // Render ImGui overlay as the very last step before the frame is presented.
+    // This is guarded by a shared tick so that it only runs once per frame
+    // even if both hooks fire for the same visual frame.
+    // We must wrap the overlay rendering in BeginScene/EndScene because the game's
+    // main scene has already ended at this point.
+    {
+        const uint64_t now = GetTickCount64();
+        if (now != s_lastOverlayTick) {
+            s_lastOverlayTick = now;
+            if (SUCCEEDED(device->BeginScene())) {
+                RenderOverlay();
+                device->EndScene();
+            }
         }
     }
 
@@ -844,6 +1426,25 @@ HRESULT WINAPI SwapChainPresent_Hook(IDirect3DSwapChain9* swapChain, const RECT*
             Core::Instance().SetState(CaptureState::Idle);
         }
     }
+
+    // Render ImGui overlay as the very last step before the frame is presented.
+    // Guarded by the same shared tick to prevent double-rendering.
+    // We get the device from the swapchain and wrap it in BeginScene/EndScene.
+    {
+        const uint64_t now = GetTickCount64();
+        if (now != s_lastOverlayTick) {
+            s_lastOverlayTick = now;
+            IDirect3DDevice9* device = nullptr;
+            if (SUCCEEDED(swapChain->GetDevice(&device)) && device) {
+                if (SUCCEEDED(device->BeginScene())) {
+                    RenderOverlay();
+                    device->EndScene();
+                }
+                device->Release();
+            }
+        }
+    }
+
     return SwapChainPresent_Original(swapChain, sourceRect, destRect, destWindowOverride, dirtyRegion, dwFlags);
 }
 

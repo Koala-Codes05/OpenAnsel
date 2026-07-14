@@ -1,0 +1,4 @@
+C:\Users\Anakin\OpenAnsel\src\backends\dxgi\dxgi_proxy.cpp;C:\Users\Anakin\OpenAnsel\build64\src\backends\dxgi\openansel_dxgi.dir\Release\dxgi_proxy.obj
+C:\Users\Anakin\OpenAnsel\src\backends\dxgi\dxgi_backend.cpp;C:\Users\Anakin\OpenAnsel\build64\src\backends\dxgi\openansel_dxgi.dir\Release\dxgi_backend.obj
+C:\Users\Anakin\OpenAnsel\src\backends\dxgi\dx11_hooks.cpp;C:\Users\Anakin\OpenAnsel\build64\src\backends\dxgi\openansel_dxgi.dir\Release\dx11_hooks.obj
+C:\Users\Anakin\OpenAnsel\src\backends\dxgi\dx12_hooks.cpp;C:\Users\Anakin\OpenAnsel\build64\src\backends\dxgi\openansel_dxgi.dir\Release\dx12_hooks.obj
