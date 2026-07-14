@@ -51,10 +51,14 @@ struct DX11CaptureState {
     uint64_t vpFoundTick = 0;
     uint32_t framesAfterVpFound = 0;
 
+    // Safe screenshot mode: no matrix patching, just readback current frame
+    bool safeCapture = false;
+
     std::unique_ptr<ImageWriter> writer;
     ID3D11Texture2D* stagingTexture = nullptr;
     ID3D11Query* flushQuery = nullptr;
 };
+
 static DX11CaptureState g_capture;
 static float g_screenAspect = 1.7777f;
 
@@ -105,30 +109,62 @@ static void MatMulRowMajor(const float* A, const float* B, float* C) {
     }
 }
 
-static void BuildClipTileMatrix(uint32_t tx, uint32_t ty, uint32_t NX, uint32_t NY, float* T) {
+// Tile-shift matrix T: scales NDC x/y by NX,NY then shifts so tile (tx,ty) fills [-1,1].
+// For ROW-VECTOR convention (HLSL: mul(pos, VP)), T is right-multiplied: VP' = VP * T.
+// T in row-major flat storage:
+//   [ NX    0   0  0 ]
+//   [  0   NY   0  0 ]
+//   [  0    0   1  0 ]
+//   [ tx'  ty'  0  1 ]
+// tx' = NX - 2*tx - 1  (positive for left tiles, negative for right tiles)
+// ty' = -(NY - 2*ty - 1)  NOTE: negated! In DirectX clip space +y = top of screen,
+//       so top tile (ty=0) needs ty' = -1 to zoom into [0,1] NDC-y (top half).
+static void BuildClipTileMatrixRowMajor(uint32_t tx, uint32_t ty, uint32_t NX, uint32_t NY, float* T) {
     std::memset(T, 0, 16 * sizeof(float));
-    // Column-major layout (HLSL default)
-    T[0] = float(NX);
-    T[5] = float(NY);
-    T[10] = 1.0f;
-    T[15] = 1.0f;
-    T[12] = float(NX) - 2.0f * float(tx) - 1.0f;
-    T[13] = 2.0f * float(ty) + 1.0f - float(NY);
+    T[0]  = float(NX);                                          // Row 0 x-scale
+    T[5]  = float(NY);                                          // Row 1 y-scale
+    T[10] = 1.0f;                                               // Row 2 z pass-through
+    T[12] = float(NX) - 2.0f * float(tx) - 1.0f;              // Row 3 x-offset: tx'
+    T[13] = -(float(NY) - 2.0f * float(ty) - 1.0f);           // Row 3 y-offset: -ty' (negated!)
+    T[15] = 1.0f;                                               // Row 3 w pass-through
 }
+
+// For COLUMN-VECTOR convention (HLSL: mul(VP, pos)), T is left-multiplied: VP' = T * VP.
+// T in column-major flat storage (col*4+row):
+//   [ NX    0   0  tx' ]   row 0
+//   [  0   NY   0  ty' ]   row 1
+//   [  0    0   1   0  ]   row 2
+//   [  0    0   0   1  ]   row 3
+// Translation lives in COLUMN 3 → flat indices T[12]=tx', T[13]=ty'
+// ty' = -(NY - 2*ty - 1) same sign convention as row-major
+static void BuildClipTileMatrixColMajor(uint32_t tx, uint32_t ty, uint32_t NX, uint32_t NY, float* T) {
+    std::memset(T, 0, 16 * sizeof(float));
+    T[0]  = float(NX);                                          // Col 0, Row 0: x-scale
+    T[5]  = float(NY);                                          // Col 1, Row 1: y-scale
+    T[10] = 1.0f;                                               // Col 2, Row 2: z pass-through
+    T[12] = float(NX) - 2.0f * float(tx) - 1.0f;              // Col 3, Row 0: tx'
+    T[13] = -(float(NY) - 2.0f * float(ty) - 1.0f);           // Col 3, Row 1: ty' (negated!)
+    T[15] = 1.0f;                                               // Col 3, Row 3: w pass-through
+}
+
 
 static void ApplyClipTile(const float* src, float* dst, uint32_t tx, uint32_t ty,
                           uint32_t NX, uint32_t NY, bool usePreMultiply) {
     float T[16] = {};
-    BuildClipTileMatrix(tx, ty, NX, NY, T);
 
     if (usePreMultiply) {
-        // HLSL: mul(VP, pos)  =>  VP' = T * VP
+        // Column-vector convention: clip_pos = VP * object_pos
+        // Tile shift: VP' = T * VP  (T left-multiplied in column-major)
+        BuildClipTileMatrixColMajor(tx, ty, NX, NY, T);
         MatMulColMajor(T, src, dst);
     } else {
-        // HLSL: mul(pos, VP)  =>  VP' = VP * T
+        // Row-vector convention: clip_pos = object_pos * VP
+        // Tile shift: VP' = VP * T  (T right-multiplied in row-major)
+        BuildClipTileMatrixRowMajor(tx, ty, NX, NY, T);
         MatMulRowMajor(src, T, dst);
     }
 }
+
 
 static bool MatrixIsFinite(const float* m) {
     for (int i = 0; i < 16; ++i) {
@@ -217,6 +253,25 @@ static bool DetectProjectionOrVPMatrix(const float* m, bool& usePreMultiply) {
     return false;
 }
 
+static void DumpConstantBuffer(const float* data, size_t numFloats, ID3D11Resource* resource) {
+    char buf[2048];
+    int len = sprintf_s(buf, "CB CONTENT DUMP for %p (%zu floats):", resource, numFloats);
+    for (size_t i = 0; i < numFloats; ++i) {
+        if (i % 4 == 0) {
+            len += sprintf_s(buf + len, sizeof(buf) - len, "\n  [%4zu] ", i * sizeof(float));
+        }
+        len += sprintf_s(buf + len, sizeof(buf) - len, "%12.6f ", data[i]);
+        if (len > sizeof(buf) - 200) {
+            DXGI::Log(buf);
+            len = 0;
+            buf[0] = '\0';
+        }
+    }
+    if (len > 0) {
+        DXGI::Log(buf);
+    }
+}
+
 static bool TryMatchMatrix(ID3D11Resource* resource, const float* floats, size_t numFloats,
                            bool isDynamic, const char* source) {
     if (numFloats < 16) return false;
@@ -252,6 +307,10 @@ static bool TryMatchMatrix(ID3D11Resource* resource, const float* floats, size_t
                   floats[i + 8], floats[i + 9], floats[i + 10], floats[i + 11],
                   floats[i + 12], floats[i + 13], floats[i + 14], floats[i + 15]);
         DXGI::Log(logBuf);
+
+        // Dump full constant buffer details to log for diagnostics
+        DumpConstantBuffer(floats, numFloats, resource);
+
         return true;
     }
     return false;
@@ -500,12 +559,16 @@ static void FlushGPU(ID3D11DeviceContext* context) {
 // --- Capture & Hotkeys ---
 
 static void PollCaptureHotkeys(ID3D11DeviceContext* context) {
-    static bool s_wasDown = false;
-    const bool isDown = ((GetAsyncKeyState(VK_F10) & 0x8000) != 0) ||
-                        ((GetAsyncKeyState(VK_F11) & 0x8000) != 0);
-    if (isDown && !s_wasDown) {
+    static bool s_wasDown10 = false;
+    static bool s_wasDown9  = false;
+
+    // F10/F11 = tiled super-resolution capture (with matrix patching)
+    const bool isDown10 = ((GetAsyncKeyState(VK_F10) & 0x8000) != 0) ||
+                          ((GetAsyncKeyState(VK_F11) & 0x8000) != 0);
+    if (isDown10 && !s_wasDown10) {
         if (!g_capture.active) {
             g_capture.active = true;
+            g_capture.safeCapture = false;
             g_capture.scanningForProjection = true;
             g_capture.gotOriginalProjection = false;
             g_capture.readyForCapture = false;
@@ -525,31 +588,54 @@ static void PollCaptureHotkeys(ID3D11DeviceContext* context) {
             InstallDrawHooks(context);
         }
     }
-    s_wasDown = isDown;
+    s_wasDown10 = isDown10;
+
+    // F9 = safe single-frame screenshot (no matrix patching, just capture current backbuffer)
+    const bool isDown9 = ((GetAsyncKeyState(VK_F9) & 0x8000) != 0);
+    if (isDown9 && !s_wasDown9) {
+        if (!g_capture.active) {
+            g_capture.active = true;
+            g_capture.safeCapture = true;
+            g_capture.scanningForProjection = false;
+            g_capture.gotOriginalProjection = true;
+            g_capture.readyForCapture = true;
+            g_capture.tileCountX = 1;
+            g_capture.tileCountY = 1;
+            g_capture.currentTile = 0;
+            g_capture.lastCaptureTick = 0;
+            g_capture.framesAfterVpFound = 0;
+            g_capture.vpFoundTick = GetTickCount64();
+            g_capture.writer.reset();
+            DXGI::Log("DX11: Safe screenshot started (F9 pressed). No matrix patching.");
+        }
+    }
+    s_wasDown9 = isDown9;
 }
 
 static void CaptureFrameDX11(IDXGISwapChain* swapChain, ID3D11DeviceContext* context) {
     if (!g_capture.active) return;
 
-    if (g_capture.scanningForProjection) {
-        const uint64_t elapsed = GetTickCount64() - g_capture.vpFoundTick;
-        if (elapsed > 5000) {
-            DXGI::Log("DX11: VP scan timed out after 5s, aborting capture");
-            g_capture.active = false;
-            g_capture.writer.reset();
-            RemoveDrawHooks(context);
-            RemoveContextHooks(context);
+    if (!g_capture.safeCapture) {
+        if (g_capture.scanningForProjection) {
+            const uint64_t elapsed = GetTickCount64() - g_capture.vpFoundTick;
+            if (elapsed > 5000) {
+                DXGI::Log("DX11: VP scan timed out after 5s, aborting capture");
+                g_capture.active = false;
+                g_capture.writer.reset();
+                RemoveDrawHooks(context);
+                RemoveContextHooks(context);
+            }
+            return;
         }
-        return;
-    }
 
-    if (!g_capture.readyForCapture) {
-        ++g_capture.framesAfterVpFound;
-        if (g_capture.framesAfterVpFound >= 2) {
-            g_capture.readyForCapture = true;
-            DXGI::Log("DX11: VP matrix settled, starting tile readback");
+        if (!g_capture.readyForCapture) {
+            ++g_capture.framesAfterVpFound;
+            if (g_capture.framesAfterVpFound >= 2) {
+                g_capture.readyForCapture = true;
+                DXGI::Log("DX11: VP matrix settled, starting tile readback");
+            }
+            return;
         }
-        return;
     }
 
     const bool multiTile = (g_capture.tileCountX * g_capture.tileCountY) > 1;
@@ -613,7 +699,8 @@ static void CaptureFrameDX11(IDXGISwapChain* swapChain, ID3D11DeviceContext* con
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    hr = Map_Original(context, g_capture.stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    // Always use the raw vtable call for staging readback — Map_Original may be null in safe mode
+    hr = context->Map(g_capture.stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
     if (SUCCEEDED(hr)) {
         const uint32_t tileX = g_capture.currentTile % g_capture.tileCountX;
         const uint32_t tileY = g_capture.currentTile / g_capture.tileCountX;
@@ -638,9 +725,19 @@ static void CaptureFrameDX11(IDXGISwapChain* swapChain, ID3D11DeviceContext* con
                         desc.Width * bpp);
         }
 
+        // Many DX11 games write alpha=0 to the backbuffer (the display ignores alpha).
+        // Viewers render alpha=0 pixels against white → appears blank. Force alpha=255.
+        if (bpp == 4) {
+            uint8_t* p = contiguousPixels.data();
+            const size_t total = static_cast<size_t>(desc.Width) * desc.Height * 4;
+            for (size_t i = 3; i < total; i += 4) {
+                p[i] = 0xFF;
+            }
+        }
+
         const bool ok = g_capture.writer->AddTile(tileX, tileY, desc.Width, desc.Height,
                                                   contiguousPixels.data(), desc.Format);
-        Unmap_Original(context, g_capture.stagingTexture, 0);
+        context->Unmap(g_capture.stagingTexture, 0);
 
         if (ok) {
             g_capture.currentTile++;
@@ -676,20 +773,36 @@ static void CaptureFrameDX11(IDXGISwapChain* swapChain, ID3D11DeviceContext* con
                 g_capture.active = false;
                 g_capture.readyForCapture = false;
 
-                RemoveDrawHooks(context);
-                RemoveContextHooks(context);
+                // Restore default tile count for next tiled capture
+                if (g_capture.safeCapture) {
+                    DXGI::Log("DX11: Safe screenshot complete, no hooks to remove.");
+                    g_capture.tileCountX = 2;
+                    g_capture.tileCountY = 2;
+                } else {
+                    RemoveDrawHooks(context);
+                    RemoveContextHooks(context);
+                }
             }
         } else {
             DXGI::Log("DX11: AddTile failed!");
             g_capture.writer.reset();
             g_capture.active = false;
-            RemoveDrawHooks(context);
-            RemoveContextHooks(context);
+            if (!g_capture.safeCapture) {
+                RemoveDrawHooks(context);
+                RemoveContextHooks(context);
+            }
+            g_capture.tileCountX = 2;
+            g_capture.tileCountY = 2;
         }
     } else {
         DXGI::Log("DX11 Present_Hook: Failed to map staging texture!");
-        RemoveDrawHooks(context);
-        RemoveContextHooks(context);
+        if (!g_capture.safeCapture) {
+            RemoveDrawHooks(context);
+            RemoveContextHooks(context);
+        }
+        g_capture.active = false;
+        g_capture.tileCountX = 2;
+        g_capture.tileCountY = 2;
     }
 
     device->Release();
