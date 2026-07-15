@@ -22,3 +22,7 @@ option(OPENANSEL_BUILD_DX9  "Build the DX9 proxy backend (d3d9.dll)"  ON)
 option(OPENANSEL_BUILD_DXGI "Build the DXGI proxy backend (dxgi.dll)" ON)
 
 add_subdirectory(src)
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+enable_testing()
+add_subdirectory(src/tests)

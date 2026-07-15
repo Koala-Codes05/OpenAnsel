@@ -9,7 +9,8 @@
 		"C:/Users/Anakin/OpenAnsel/build64/src/backends/dxgi/cmake_install.cmake",
 		"C:/Users/Anakin/OpenAnsel/build64/src/io/cmake_install.cmake",
 		"C:/Users/Anakin/OpenAnsel/build64/src/injector/cmake_install.cmake",
-		"C:/Users/Anakin/OpenAnsel/build64/src/launcher/cmake_install.cmake"
+		"C:/Users/Anakin/OpenAnsel/build64/src/launcher/cmake_install.cmake",
+		"C:/Users/Anakin/OpenAnsel/build64/src/tests/cmake_install.cmake"
 	],
 	"Parallel" : false
 }

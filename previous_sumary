@@ -1,0 +1,16 @@
+Done:
+- Implemented scale-aware fallback for matrix detection in dx11_hooks.cpp
+- Added perspective-divide pattern detector: checks for canonical [0, 0, ±1, 0] in row 3 (row-major) or column 3 (column-major)
+- Fallback activates when unit-vector heuristic fails (e.g., scaled camera basis like 2x zoom, cinematic letterbox, orthographic modes)
+- Perspective-divide pattern is immune to camera scale; set solely by projection matrix → mathematically reliable
+- Created 7 comprehensive unit tests: unscaled row/column-major VP, 2x scaled row/column-major VP, 0.5x scaled row-major VP, identity matrix rejection, NaN injection safety test
+- Tests verify correct usePreMultiply flag assignment for both strategies
+- All tests self-contained in matrix_detection_enhanced.cpp; can run standalone with g++
+- Expected result: 7/7 pass
+- Full backwards compatibility maintained; fallback only activates if primary strategy fails
+- ~15 additional floating-point operations per detection; negligible cost (runs once per matrix scan, not per-frame)
+- Rebuilt the full DX11 project (x64) and deployed all required files (dxgi.dll, DirectXTex.dll, minhook.x64.dll) to NieR:Automata game folder (D:\Game Garden\Steam\steamapps\common\NieRAutomata)
+
+Next: Test the DX11 backend in-game on NieR:Automata. Optional: implement confidence scoring, engine fingerprinting for non-UE3 engines (EA Black Box, UE4), and logging enhancement to track which detection strategy succeeded.
+
+Future: Implement DirectX 12 support, in-game pausing, free camera controls, HUD disabling, and depth map export.

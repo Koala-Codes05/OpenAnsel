@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Anakin\OpenAnsel\build64\CMakeFiles\d260d71f2faa5b903e06650e868aff2e\RUN_TESTS_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{A8E7663E-1283-33AD-937C-5B915DBE8D82}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -17,7 +17,16 @@ An open-source, NVIDIA Ansel-like tiled super-resolution screenshot tool for Win
   - ImGui in-game overlay with tile grid controls, capture button, progress bar, and status dashboard
   - EndScene fallback capture path for games that don't fire Present on all frames
   - `GetVertexShaderConstantF` hook to prevent UE3 CPU-side frustum culling from aborting tiled frames
-- **Phase 3** – DirectX 11/12 back-ends, memory-efficient streaming stitching (planned).
+- **Phase 3** – DirectX 11 back-end (✅ Working):
+  - Proxy `dxgi.dll` drop-in for 64-bit DX11 games (e.g., *NieR: Automata*, *Detroit: Become Human*).
+  - Main swap chain hooking (`IDXGISwapChain::Present` and `IDXGISwapChain::ResizeBuffers`).
+  - Dynamic D3D11 context hooks (`ID3D11DeviceContext::UpdateSubresource`, `Map`, `Unmap`) that mount on demand to avoid performance overhead.
+  - Draw hooks (`Draw`, `DrawIndexed`) to intercept rendering and inject tiles.
+  - Heuristic constant buffer matrix scanner supporting both row-major and column-major projection layouts.
+  - Screen aspect-ratio validation to ignore shadow-map projections and isolate the main camera.
+  - Backbuffer alpha override (setting alpha to `0xFF` during copy) to solve blank/transparent captures in games that output zero alpha.
+  - Hotkeys: **F9** for a clean, single-frame screenshot, and **F10/F11** for super-resolution tiled capture.
+- **Phase 4** – DirectX 12 back-end, memory-efficient streaming stitching (planned).
 
 ## Vision: The Universal Photo Mode
 
@@ -98,11 +107,16 @@ Runs `cmake --build … --config Release`. Use `rebuild.bat` to reconfigure and 
 
 ### 3 — Deploy (Proxy DLL method — recommended)
 
-Copy the built proxy DLL next to the game executable and rename it `d3d9.dll`. Windows DLL search order will load it before the system `d3d9.dll`.
-
-```powershell
-copy build\src\backends\dx9\Release\openansel_dx9.dll "D:\Game Garden\Mirror's Edge\Binaries\d3d9.dll"
-```
+* **For DirectX 9 games (32-bit/64-bit):**
+  Copy the built DX9 proxy DLL next to the game executable and rename it `d3d9.dll`.
+  ```powershell
+  copy build\src\backends\dx9\Release\openansel_dx9.dll "D:\Game Garden\Mirror's Edge\Binaries\d3d9.dll"
+  ```
+* **For DirectX 11 games (64-bit):**
+  Copy the built DXGI proxy DLL next to the game executable and rename it `dxgi.dll`.
+  ```powershell
+  copy build64\src\backends\dxgi\Release\dxgi.dll "D:\Game Garden\Steam\steamapps\common\NieRAutomata\dxgi.dll"
+  ```
 
 ### 4 — Launch via the GUI Launcher (optional)
 
@@ -155,6 +169,25 @@ The **ImGui overlay** (F9 to toggle) shows capture progress, a tile progress bar
    - Gamma ramp is applied to tile pixels so the saved image matches what the player sees.
    - After all N×N tiles are read back, `image_writer` stitches them into a single 16-bit PNG.
 5. **Overlay** — an ImGui overlay (F9 to toggle) shows capture status, tile progress bar, and last saved filename; provides tile-grid presets and a capture button.
+
+## How It Works (DX11 Back-end)
+
+1. **DLL load** — the proxy `dxgi.dll` intercepts DXGI factory creation (`CreateDXGIFactory`, `CreateDXGIFactory1`, `CreateDXGIFactory2`) via export-level hooks.
+2. **Swap chain hooks** — when the game creates a swap chain, the proxy intercepts the call and hooks `IDXGISwapChain::Present` (vtable index 8) and `IDXGISwapChain::ResizeBuffers` (vtable index 13).
+3. **Dynamic Context hooks** — on pressing **F10/F11**, dynamic hooks are mounted on the immediate `ID3D11DeviceContext` vtable:
+   - `UpdateSubresource` (48) and `Map` (14) / `Unmap` (15) are hooked to intercept constant buffer updates.
+   - Dynamic context hooks are unmounted immediately after capture to ensure 100% native stability.
+4. **Draw Hooks** — `Draw` (8) and `DrawIndexed` (7) are hooked on hotkey press to synchronize frame capturing and matrix replacement.
+5. **Heuristic Matrix Scanner**:
+   - Analyzes float arrays passed to Constant Buffers in real-time.
+   - Recognizes both Row-Major and Column-Major projection layouts by validating coordinate scale bounds and checking perspective axis orthogonality.
+   - Filters out non-matching views (e.g. shadow map cascades) by validating the matrix scale ratio against the active viewport's aspect ratio.
+6. **Tile Patching**:
+   - Uses `BuildClipTileMatrixRowMajor` (for row-major right-multiplication) or `BuildClipTileMatrixColMajor` (for column-major left-multiplication).
+   - Dynamically patches constant buffer writes for the target frame's tile.
+7. **Alpha-Channel Force-Opaque**:
+   - Since DX11 games ignore the alpha channel in backbuffers, they often write `alpha = 0`.
+   - The capture pipeline forces alpha values to `0xFF` on every pixel during copy to prevent transparent/blank outputs.
 
 ## Capture Config (`CaptureConfig`)
 

@@ -44,6 +44,7 @@ struct DX11CaptureState {
     bool scanningForProjection = false;
     bool gotOriginalProjection = false;
     bool readyForCapture = false;
+    bool needsMatrixPatch = false;
     uint32_t tileCountX = 2;
     uint32_t tileCountY = 2;
     uint32_t currentTile = 0;
@@ -61,6 +62,9 @@ struct DX11CaptureState {
 
 static DX11CaptureState g_capture;
 static float g_screenAspect = 1.7777f;
+// Thread-local flag: set to true when the fallback perspective-divide
+// pattern was what caused DetectProjectionOrVPMatrix to succeed.
+static thread_local bool t_usePerspectiveDivideFallback = false;
 
 // --- Constant Buffer Hook State ---
 struct MatchedCB {
@@ -70,6 +74,10 @@ struct MatchedCB {
     bool usePreMultiply = true;
     bool found = false;
     float originalMatrix[16] = {};
+    // Full last-known-good CB content (captured pre-patch), used to rebuild the
+    // buffer after a WRITE_DISCARD map, since DISCARD invalidates everything
+    // else the game packed into this CB alongside the VP matrix.
+    std::vector<uint8_t> fullContent;
 };
 static MatchedCB g_matchedCB;
 static std::mutex g_cbMutex;
@@ -174,6 +182,7 @@ static bool MatrixIsFinite(const float* m) {
 }
 
 static bool DetectProjectionOrVPMatrix(const float* m, bool& usePreMultiply) {
+    t_usePerspectiveDivideFallback = false;  // reset on every entry
     if (!MatrixIsFinite(m)) return false;
 
     int zeroCount = 0;
@@ -182,40 +191,40 @@ static bool DetectProjectionOrVPMatrix(const float* m, bool& usePreMultiply) {
     }
 
     if (zeroCount < 6) {
-        // Column-major VP: forward vector in column 3 (indices 3,7,11)
+        // Row-major VP (row-vector convention): forward vector is in column 3 (indices 3,7,11)
         float len_c3 = std::sqrt(m[3] * m[3] + m[7] * m[7] + m[11] * m[11]);
         float len_c0 = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
         float len_c1 = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
         float len_c2 = std::sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
 
-        bool colMajorVP = (len_c0 >= 0.2f && len_c0 <= 6.0f &&
+        bool rowMajorVP = (len_c0 >= 0.2f && len_c0 <= 6.0f &&
                            len_c1 >= 0.2f && len_c1 <= 6.0f &&
                            len_c2 >= 0.2f && len_c2 <= 6.0f &&
                            len_c3 >= 0.75f && len_c3 <= 1.25f);
 
         if (std::abs(len_c0 - 1.0f) < 0.02f && std::abs(len_c1 - 1.0f) < 0.02f) {
-            colMajorVP = false;
+            rowMajorVP = false;
         }
 
-        // Row-major VP: forward vector in row 3 (indices 12,13,14)
+        // Column-major VP (column-vector convention): forward vector is in row 3 (indices 12,13,14)
         float len_r3 = std::sqrt(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
         float len_r0 = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
         float len_r1 = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
         float len_r2 = std::sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
 
-        bool rowMajorVP = (len_r0 >= 0.2f && len_r0 <= 6.0f &&
+        bool colMajorVP = (len_r0 >= 0.2f && len_r0 <= 6.0f &&
                            len_r1 >= 0.2f && len_r1 <= 6.0f &&
                            len_r2 >= 0.2f && len_r2 <= 6.0f &&
                            len_r3 >= 0.75f && len_r3 <= 1.25f);
 
         if (std::abs(len_r0 - 1.0f) < 0.02f && std::abs(len_r1 - 1.0f) < 0.02f) {
-            rowMajorVP = false;
+            colMajorVP = false;
         }
 
         float ratioCol = (len_c0 > 0.01f) ? len_c1 / len_c0 : 0.0f;
         float ratioRow = (len_r0 > 0.01f) ? len_r1 / len_r0 : 0.0f;
-        if (std::abs(ratioCol - g_screenAspect) > 0.15f) colMajorVP = false;
-        if (std::abs(ratioRow - g_screenAspect) > 0.15f) rowMajorVP = false;
+        if (std::abs(ratioCol - g_screenAspect) > 0.15f) rowMajorVP = false; // ratioCol uses len_c1/len_c0 -> Row-Major aspect
+        if (std::abs(ratioRow - g_screenAspect) > 0.15f) colMajorVP = false; // ratioRow uses len_r1/len_r0 -> Col-Major aspect
 
         if (colMajorVP && !rowMajorVP) {
             usePreMultiply = true;
@@ -229,7 +238,54 @@ static bool DetectProjectionOrVPMatrix(const float* m, bool& usePreMultiply) {
             usePreMultiply = true;
             return true;
         }
-    } else if (zeroCount >= 10) {
+        // Primary heuristic failed (forward-vector length out of range, e.g. scaled camera basis).
+        // Fall through to perspective-divide fallback below.
+    }
+
+    // ── Scale-aware fallback ──────────────────────────────────────────────────
+    // The perspective-divide row/column is set solely by the projection matrix
+    // and is invariant to any scaling baked into the view basis.
+    // Row-major layout   : column 3 = [0, 0, ±1, 0]  (flat indices 3, 7, 11, 15)
+    // Column-major layout: row 3    = [0, 0, ±1, 0]  (flat indices 12, 13, 14, 15)
+    {
+        const float eps = 0.0001f;
+        // Row-major VP: perspective-divide is in column 3 (indices 3, 7, 11, 15)
+        bool rowMajorPD = (std::abs(m[3])  < eps &&
+                           std::abs(m[7])  < eps &&
+                          (std::abs(m[11] - 1.0f) < eps || std::abs(m[11] + 1.0f) < eps) &&
+                           std::abs(m[15]) < eps &&
+                           // Ensure diagonal has plausible perspective/scale coefficients
+                           m[0] > 0.01f && m[0] < 100.0f &&
+                           m[5] > 0.01f && m[5] < 100.0f);
+
+        // Column-major VP: perspective-divide is in row 3 (indices 12, 13, 14, 15)
+        bool colMajorPD = (std::abs(m[12]) < eps &&
+                           std::abs(m[13]) < eps &&
+                          (std::abs(m[14] - 1.0f) < eps || std::abs(m[14] + 1.0f) < eps) &&
+                           std::abs(m[15]) < eps &&
+                           m[0] > 0.01f && m[0] < 100.0f &&
+                           m[5] > 0.01f && m[5] < 100.0f);
+
+        if (colMajorPD && !rowMajorPD) {
+            usePreMultiply = true;
+            t_usePerspectiveDivideFallback = true;
+            return true;
+        }
+        if (rowMajorPD && !colMajorPD) {
+            usePreMultiply = false;
+            t_usePerspectiveDivideFallback = true;
+            return true;
+        }
+        if (colMajorPD && rowMajorPD) {
+            // Ambiguous – default to column-major (pre-multiply) to match primary strategy
+            usePreMultiply = true;
+            t_usePerspectiveDivideFallback = true;
+            return true;
+        }
+    }
+
+    // ── Pure projection-matrix detection (unchanged) ─────────────────────────
+    if (zeroCount >= 10) {
         bool rowProj = (std::abs(m[1]) < 0.0001f && std::abs(m[2]) < 0.0001f && std::abs(m[3]) < 0.0001f &&
                         std::abs(m[4]) < 0.0001f && std::abs(m[6]) < 0.0001f && std::abs(m[7]) < 0.0001f &&
                         std::abs(m[8]) < 0.0001f && std::abs(m[9]) < 0.0001f &&
@@ -242,10 +298,12 @@ static bool DetectProjectionOrVPMatrix(const float* m, bool& usePreMultiply) {
 
         if (rowProj && m[0] > 0.05f && m[0] < 20.0f && m[5] > 0.05f && m[5] < 20.0f) {
             usePreMultiply = false;
+            t_usePerspectiveDivideFallback = true;
             return true;
         }
         if (colProj && m[0] > 0.05f && m[0] < 20.0f && m[5] > 0.05f && m[5] < 20.0f) {
             usePreMultiply = true;
+            t_usePerspectiveDivideFallback = true;
             return true;
         }
     }
@@ -296,12 +354,13 @@ static bool TryMatchMatrix(ID3D11Resource* resource, const float* floats, size_t
 
         char logBuf[512];
         sprintf_s(logBuf,
-                  "DX11 %s: Found VP matrix in CB %p offset %zu (PreMul=%d Dynamic=%d)\n"
+                  "DX11 %s (%s): Found VP matrix in CB %p offset %zu (PreMul=%d Dynamic=%d)\n"
                   "  [%f, %f, %f, %f]\n"
                   "  [%f, %f, %f, %f]\n"
                   "  [%f, %f, %f, %f]\n"
                   "  [%f, %f, %f, %f]",
-                  source, resource, g_matchedCB.offset, usePreMultiply ? 1 : 0, isDynamic ? 1 : 0,
+                  source, t_usePerspectiveDivideFallback ? "PerspectiveDivide" : "Standard",
+                  resource, g_matchedCB.offset, usePreMultiply ? 1 : 0, isDynamic ? 1 : 0,
                   floats[i], floats[i + 1], floats[i + 2], floats[i + 3],
                   floats[i + 4], floats[i + 5], floats[i + 6], floats[i + 7],
                   floats[i + 8], floats[i + 9], floats[i + 10], floats[i + 11],
@@ -333,6 +392,9 @@ static void PatchMatrixAtOffset(float* matrixPtr) {
     std::memcpy(matrixPtr, patchedMatrix, 16 * sizeof(float));
 }
 
+static const char* g_noCbSnapshotFmt = "DX11: ReapplyTileToMatchedCB skipped tile %u -- no full CB snapshot yet (have %zu bytes, want %u)";
+static const char* g_mapDiscardFailFmt = "DX11: Map_Original FAILED hr=0x%08X on tile %u (WRITE_DISCARD)";
+
 static void ReapplyTileToMatchedCB(ID3D11DeviceContext* context) {
     if (!g_capture.active || g_capture.scanningForProjection) return;
 
@@ -346,18 +408,37 @@ static void ReapplyTileToMatchedCB(ID3D11DeviceContext* context) {
     const uint32_t tileX = g_capture.currentTile % g_capture.tileCountX;
     const uint32_t tileY = g_capture.currentTile / g_capture.tileCountX;
 
+    char diagLog[256];
+    sprintf_s(diagLog, "DX11: Patching tile %u/%u (tileX=%u, tileY=%u)",
+              g_capture.currentTile + 1, g_capture.tileCountX * g_capture.tileCountY, tileX, tileY);
+    DXGI::Log(diagLog);
+
     float patchedMatrix[16];
     ApplyClipTile(g_matchedCB.originalMatrix, patchedMatrix, tileX, tileY,
                   g_capture.tileCountX, g_capture.tileCountY, g_matchedCB.usePreMultiply);
     if (!MatrixIsFinite(patchedMatrix)) return;
 
     if (g_matchedCB.isDynamic) {
+        if (g_matchedCB.fullContent.size() != desc.ByteWidth) {
+            char warnBuf[160];
+            sprintf_s(warnBuf, g_noCbSnapshotFmt, g_capture.currentTile, g_matchedCB.fullContent.size(), desc.ByteWidth);
+            DXGI::Log(warnBuf);
+            return;
+        }
+
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(Map_Original(context, buffer, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped))) {
-            float* matrixPtr = reinterpret_cast<float*>(
-                reinterpret_cast<uint8_t*>(mapped.pData) + g_matchedCB.offset);
+        HRESULT hr = Map_Original(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr)) {
+            uint8_t* dst = reinterpret_cast<uint8_t*>(mapped.pData);
+            std::memcpy(dst, g_matchedCB.fullContent.data(), g_matchedCB.fullContent.size());
+            float* matrixPtr = reinterpret_cast<float*>(dst + g_matchedCB.offset);
             std::memcpy(matrixPtr, patchedMatrix, 16 * sizeof(float));
+            DumpConstantBuffer(reinterpret_cast<const float*>(dst), desc.ByteWidth / sizeof(float), buffer);
             Unmap_Original(context, buffer, 0);
+        } else {
+            char errBuf[160];
+            sprintf_s(errBuf, g_mapDiscardFailFmt, hr, g_capture.currentTile);
+            DXGI::Log(errBuf);
         }
     } else {
         D3D11_BOX box{};
@@ -368,6 +449,8 @@ static void ReapplyTileToMatchedCB(ID3D11DeviceContext* context) {
         box.front = 0;
         box.back = 1;
         UpdateSubresource_Original(context, buffer, 0, &box, patchedMatrix, 64, 64);
+        // Dump the patched matrix for diagnostics (since we cannot map a static buffer)
+        DumpConstantBuffer(patchedMatrix, 16, buffer);
     }
 }
 
@@ -463,6 +546,14 @@ void WINAPI Unmap_Hook(ID3D11DeviceContext* context, ID3D11Resource* pResource, 
             }
 
             if (g_capture.active && g_matchedCB.found && pResource == g_matchedCB.resource) {
+                {
+                    // Snapshot the full CB as the game just wrote it (pre-patch) so
+                    // ReapplyTileToMatchedCB can restore everything else after a
+                    // WRITE_DISCARD map.
+                    std::lock_guard<std::mutex> lock(g_cbMutex);
+                    const uint8_t* base = reinterpret_cast<const uint8_t*>(state.pData);
+                    g_matchedCB.fullContent.assign(base, base + state.size);
+                }
                 float* matrixPtr = reinterpret_cast<float*>(
                     reinterpret_cast<uint8_t*>(state.pData) + g_matchedCB.offset);
                 PatchMatrixAtOffset(matrixPtr);
@@ -473,14 +564,16 @@ void WINAPI Unmap_Hook(ID3D11DeviceContext* context, ID3D11Resource* pResource, 
 }
 
 void WINAPI DrawIndexed_Hook(ID3D11DeviceContext* context, UINT IndexCount, INT BaseVertexLocation, UINT StartIndexLocation) {
-    if (g_capture.active && !g_capture.scanningForProjection && g_matchedCB.found) {
+    if (g_capture.active && !g_capture.scanningForProjection && g_matchedCB.found && g_capture.needsMatrixPatch) {
+        g_capture.needsMatrixPatch = false;
         ReapplyTileToMatchedCB(context);
     }
     DrawIndexed_Original(context, IndexCount, BaseVertexLocation, StartIndexLocation);
 }
 
 void WINAPI Draw_Hook(ID3D11DeviceContext* context, UINT VertexCount, UINT StartVertexLocation) {
-    if (g_capture.active && !g_capture.scanningForProjection && g_matchedCB.found) {
+    if (g_capture.active && !g_capture.scanningForProjection && g_matchedCB.found && g_capture.needsMatrixPatch) {
+        g_capture.needsMatrixPatch = false;
         ReapplyTileToMatchedCB(context);
     }
     Draw_Original(context, VertexCount, StartVertexLocation);
@@ -831,6 +924,7 @@ HRESULT WINAPI Present_Hook(IDXGISwapChain* swapChain, UINT syncInterval, UINT f
 
             if (g_capture.active) {
                 CaptureFrameDX11(swapChain, context);
+                g_capture.needsMatrixPatch = true;
             }
             context->Release();
         }
